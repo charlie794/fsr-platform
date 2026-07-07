@@ -39,22 +39,6 @@ except Exception:
     except Exception:
         from filters import ButterworthLP  # type: ignore
 
-# Simple shared logger — one plain-text file, everything in it.
-try:
-    from Sensor_Testor.debugger.debug_log import log as _dbg_log
-except Exception:
-    try:
-        from debugger.debug_log import log as _dbg_log  # type: ignore
-    except Exception:
-        try:
-            from debug_log import log as _dbg_log  # type: ignore
-        except Exception:
-            def _dbg_log(msg):  # last-resort fallback
-                try:
-                    print(msg, flush=True)
-                except Exception:
-                    pass
-
 
 # ---------------------------------------------------------------------------
 # Resistance model — power_rational only (RationalVRModel / txt-file fallback
@@ -302,10 +286,17 @@ class TestRunnerWorker(QObject):
         self._pb_lock = threading.Lock()
 
     # ------------------------------------------------------------------
-    # Logging — routes to the shared plain-text debug file + terminal.
+    # Logging
     # ------------------------------------------------------------------
     def _log(self, msg: str) -> None:
-        _dbg_log(msg)
+        try:
+            print(msg, flush=True)
+        except Exception:
+            pass
+        try:
+            self.log_message.emit(str(msg))
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Calibration helpers (read models.py directly — no caching layer)
@@ -373,9 +364,8 @@ class TestRunnerWorker(QObject):
         # Reset each step so there's no carryover between sensors.
         force_filter = ButterworthLP(cutoff_hz=10.0, sample_rate_hz=1000.0)
 
-        # Stateful moving average — carries the last (window-1) samples across
         # Stateful moving average — deques persist across DAQ chunk boundaries
-        # so there's no reset artefact at chunk edges. (Original implementation.)
+        # so there's no reset artefact at chunk edges.
         _MA_WINDOW = 20
         _ma_f = deque(maxlen=_MA_WINDOW)
         _ma_r = deque(maxlen=_MA_WINDOW)
@@ -449,7 +439,7 @@ class TestRunnerWorker(QObject):
                     ra_ohm = res_mod.r_from_v_array(ra)
                 else:
                     ra_ohm = ra.copy()
-                ra_ohm    = _apply_ma(ra_ohm, _ma_r)
+                ra_ohm = _apply_ma(ra_ohm, _ma_r)
 
                 # Keep an untouched copy of the raw force chunk for the
                 # max-force check below — the start-gate trims fa/ra/fa_kg/
@@ -913,13 +903,9 @@ class TestRunnerWorker(QObject):
                         raw_r   = self._pb_rawr[:n].copy()
                         filt_f  = self._pb_f   [:n].copy()
                         filt_r  = self._pb_r   [:n].copy()
-                    self._log(f"[Step] saving {n} samples to writers")
                     self.writers.write_step_result(
                         step, raw_f, raw_r, filt_f, filt_r
                     )
-                else:
-                    self._log(f"[Step] writers unavailable — nothing saved "
-                              f"(writers={self.writers!r})")
             except Exception as e:
                 import traceback
                 self._log(f"[Writers] save error: {e}\n{traceback.format_exc()}")
@@ -976,13 +962,6 @@ class TestRunnerWorker(QObject):
             ok_all = ok_all and passed
             self._log(f"[Run] step {i}/{n_steps} done — passed={passed}")
         self._log(f"[Run] ████ COMPLETE — {'PASS' if ok_all else 'FAIL'} ████")
-        # Final flush — ensure the last (partial) batch of steps is saved.
-        try:
-            if self.writers is not None and hasattr(self.writers, "flush"):
-                self.writers.flush()
-                self._log("[Run] writers flushed")
-        except Exception as e:
-            self._log(f"[Run] writers flush error: {e}")
         try:
             self.finished.emit()
         except Exception:

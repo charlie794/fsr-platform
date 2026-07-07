@@ -113,20 +113,33 @@ class Writers:
             if not proc_force:
                 proc_force, proc_res = raw_force, raw_res
 
-            # ALWAYS save everything — raw + filtered on the same sheet —
-            # regardless of plan flags. Data safety takes priority; the plan
-            # flags no longer gate whether data is written.
-            ws = self._wb.create_sheet(title=self._unique_title(sheet_base))
-            self._write_block(ws, "Raw Data", raw_force, raw_res, True)
-            self._write_block(ws, "Filtered (Plotted) Data", proc_force, proc_res, False)
-            _dbg_log(f"[Writers] {sheet_base}: wrote raw+filtered to sheet")
+            save_raw, save_filtered, same_sheet = self._settings_flags()
+
+            if save_raw and save_filtered:
+                if same_sheet:
+                    ws = self._wb.create_sheet(title=self._unique_title(sheet_base))
+                    self._write_block(ws, "Raw Data", raw_force, raw_res, True)
+                    self._write_block(ws, "Filtered (Plotted) Data", proc_force, proc_res, False)
+                else:
+                    ws_r = self._wb.create_sheet(title=self._unique_title(sheet_base + "_Raw"))
+                    self._write_block(ws_r, "Raw Data", raw_force, raw_res, True)
+
+                    ws_f = self._wb.create_sheet(title=self._unique_title(sheet_base + "_Filtered"))
+                    self._write_block(ws_f, "Filtered (Plotted) Data", proc_force, proc_res, False)
+
+            elif save_raw:
+                ws = self._wb.create_sheet(title=self._unique_title(sheet_base))
+                self._write_block(ws, "Raw Data", raw_force, raw_res, True)
+
+            else:
+                ws = self._wb.create_sheet(title=self._unique_title(sheet_base))
+                self._write_block(ws, "Filtered (Plotted) Data", proc_force, proc_res, False)
 
             self._dirty = True
             self._save_counter += 1
 
-            # Save to disk after EVERY step so a crash never loses more than the
-            # current step's data.
-            self._save()
+            if self._save_counter >= self._save_every:
+                self._save()
 
     def write_raw(
         self,
@@ -291,8 +304,8 @@ def make_writers(
     if not os.path.isfile(path):
         wb = Workbook()
         # openpyxl refuses to save a workbook with zero visible sheets, so we
-        # keep the default sheet as a placeholder named "Info". It will sit
-        # alongside the per-test sheets; real data is added on top of it.
+        # keep the default sheet as a placeholder named "Info". Real per-test
+        # data sheets are added alongside it.
         try:
             ws0 = wb.active
             ws0.title = "Info"
