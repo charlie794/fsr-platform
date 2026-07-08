@@ -135,7 +135,6 @@ def _parse_force_cal(eq: str) -> Tuple[float, float]:
 def _smooth_force_resistance(
     force_kg: np.ndarray,
     res_ohm: np.ndarray,
-    n_out: int = 500,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Return a densified (f_smooth, r_smooth) pair that follows the natural
@@ -179,7 +178,8 @@ def _smooth_force_resistance(
         log_r = np.log10(r)
         spline = PchipInterpolator(f, log_r)
 
-        f_fine   = np.linspace(f[0], f[-1], n_out)
+        n_out = max(len(f), 2)
+        f_fine = np.linspace(f[0], f[-1], n_out)
         r_fine   = 10.0 ** spline(f_fine)
 
         return f_fine.astype(np.float32), r_fine.astype(np.float32)
@@ -428,18 +428,13 @@ class TestRunnerWorker(QObject):
 
                 total_raw += n_tot
 
-                # ── Apply equations (same as oscilloscope) ────────────────
-                # Force: Butterworth LP then calibration then moving average
-                fa_filt   = force_filter.process(fa)
-                fa_kg     = force_m * (fa_filt - force_c) / 1000.0  # grams → kg
-                fa_kg     = _apply_ma(fa_kg, _ma_f)
+                # ── Apply equations only — no filtering, no moving average ────────
+                fa_kg = force_m * (fa - force_c) / 1000.0  # grams → kg, straight from raw fa
 
-                # Resistance: power_rational model then moving average
                 if res_mod is not None:
                     ra_ohm = res_mod.r_from_v_array(ra)
                 else:
                     ra_ohm = ra.copy()
-                ra_ohm = _apply_ma(ra_ohm, _ma_r)
 
                 # Keep an untouched copy of the raw force chunk for the
                 # max-force check below — the start-gate trims fa/ra/fa_kg/
@@ -543,8 +538,8 @@ class TestRunnerWorker(QObject):
             rr  = self._pb_rawr[:n].copy()
 
         # Smooth F×R for plotting (1/x shape via log-space Pchip spline)
-        f_smooth, r_smooth = _smooth_force_resistance(f, r)
-        return f_smooth, r_smooth, rf, rr
+        # Top graph: force/resistance equations only, no smoothing.
+        return f, r, rf, rr
 
     def stop_live_plot(self) -> None:
         if self._live_stop is not None:

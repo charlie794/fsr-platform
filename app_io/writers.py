@@ -66,10 +66,12 @@ class Writers:
     - Uses bulk row appends for large datasets (much faster than per-row loops)
     """
 
-    def __init__(self, xlsx_path: str, fs_hz: float = 1000.0):
+    def __init__(self, xlsx_path: str, fs_hz: float = 1000.0,
+                 criteria_path: Optional[str] = None):
         self.xlsx_path = xlsx_path
         self._fs_hz = float(fs_hz) if fs_hz else 1000.0
         self._test_counter = 0
+        self._criteria_path = criteria_path
 
         self._lock = threading.Lock()
         self._dirty = False
@@ -79,6 +81,16 @@ class Writers:
         self._save_every = 5
 
         self._wb = self._open_or_create_workbook()
+
+        # Record which criteria file was used for this run, if any.
+        if self._criteria_path:
+            try:
+                ws0 = self._wb["Info"] if "Info" in self._wb.sheetnames else None
+                if ws0 is not None:
+                    ws0.append(["Criteria file", self._criteria_path])
+                    self._dirty = True
+            except Exception as e:
+                _dbg_log(f"[Writers] could not record criteria_path: {e}")
 
     # ----------------------------------------------------------
     # public API
@@ -290,6 +302,7 @@ def make_writers(
     base_name: Optional[str] = None,
     job_details: Optional[Dict[str, Any]] = None,
     fs_hz: float = 1000.0,
+    criteria_path: Optional[str] = None,
 ) -> Writers:
     os.makedirs(out_dir, exist_ok=True)
 
@@ -315,4 +328,4 @@ def make_writers(
             pass
         _atomic_save_workbook(wb, path)
 
-    return Writers(path, fs_hz)
+    return Writers(path, fs_hz, criteria_path=criteria_path)
