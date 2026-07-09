@@ -7,7 +7,6 @@ import re
 import threading
 import time
 from dataclasses import dataclass
-from collections import deque
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
@@ -16,28 +15,11 @@ from PyQt5.QtCore import QObject, pyqtSignal
 # ---------------------------------------------------------------------------
 # Imports — two-level fallback (package vs flat)
 # ---------------------------------------------------------------------------
-try:
-    from Sensor_Testor.domain import models
-    from Sensor_Testor.domain.models import RunConfig, TestStep, runtime_state, store
-except Exception:
-    import domain.models as models          # type: ignore
-    from domain.models import RunConfig, TestStep, runtime_state, store  # type: ignore
+from Sensor_Testor.domain import models
+from Sensor_Testor.domain.models import RunConfig, TestStep, runtime_state, store
+from Sensor_Testor.runner.path_utils import resolve_criteria_path
 
-try:
-    from Sensor_Testor.runner.path_utils import resolve_criteria_path
-except Exception:
-    try:
-        from runner.path_utils import resolve_criteria_path  # type: ignore
-    except Exception:
-        resolve_criteria_path = None  # type: ignore
-
-try:
-    from Sensor_Testor.processing.filters import ButterworthLP
-except Exception:
-    try:
-        from processing.filters import ButterworthLP  # type: ignore
-    except Exception:
-        from filters import ButterworthLP  # type: ignore
+from Sensor_Testor.processing.stream_filter import StreamFilter
 
 
 # ---------------------------------------------------------------------------
@@ -119,76 +101,6 @@ def _parse_force_cal(eq: str) -> Tuple[float, float]:
 
 
 # ---------------------------------------------------------------------------
-# Smooth curve interpolation for Force × Resistance plot
-#
-# The physical relationship between force and resistance is approximately
-# R ∝ 1/F (a hyperbolic / 1/x curve).  pyqtgraph's default setData draws
-# straight lines between sample points, which produces a staircase on a
-# log-resistance axis and misrepresents the shape between samples.
-#
-# Fix: interpolate in log(R) space using a monotone cubic (Pchip) spline,
-# then densify to ~500 pts so the rendered curve follows the 1/x shape.
-# Only called for the Force × Resistance plot — the sample-number plots
-# use raw index spacing and don't need this treatment.
-# ---------------------------------------------------------------------------
-
-def _smooth_force_resistance(
-    force_kg: np.ndarray,
-    res_ohm: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Return a densified (f_smooth, r_smooth) pair that follows the natural
-    1/x curve between measured points.
-
-    Steps:
-      1. Drop NaN / non-positive resistance values.
-      2. Sort by force (x axis).
-      3. Deduplicate force values (pchip requires strictly monotone x).
-      4. Fit a Pchip spline in log10(R) space.
-      5. Evaluate on a fine grid and exponentiate back to linear R.
-
-    Falls back to the raw arrays if anything goes wrong (< 2 valid points,
-    scipy unavailable, etc.).
-    """
-    try:
-        from scipy.interpolate import PchipInterpolator
-    except ImportError:
-        return force_kg, res_ohm
-
-    try:
-        f = np.asarray(force_kg, dtype=float)
-        r = np.asarray(res_ohm,  dtype=float)
-
-        # Keep only finite, positive-resistance points
-        valid = np.isfinite(f) & np.isfinite(r) & (r > 0)
-        f, r  = f[valid], r[valid]
-        if len(f) < 2:
-            return f, r
-
-        # Sort by force
-        order = np.argsort(f)
-        f, r  = f[order], r[order]
-
-        # Deduplicate (Pchip needs strictly increasing x)
-        _, idx = np.unique(f, return_index=True)
-        f, r   = f[idx], r[idx]
-        if len(f) < 2:
-            return f, r
-
-        log_r = np.log10(r)
-        spline = PchipInterpolator(f, log_r)
-
-        n_out = max(len(f), 2)
-        f_fine = np.linspace(f[0], f[-1], n_out)
-        r_fine   = 10.0 ** spline(f_fine)
-
-        return f_fine.astype(np.float32), r_fine.astype(np.float32)
-
-    except Exception:
-        return force_kg, res_ohm
-
-
-# ---------------------------------------------------------------------------
 # Step result
 # ---------------------------------------------------------------------------
 
@@ -215,13 +127,14 @@ class TestRunnerWorker(QObject):
 
     DAQ loop mirrors the oscilloscope exactly:
       - Continuous scan, check samples_available, read numpy, process in bulk.
-      - Force filtered with a stateful Butterworth LP (10 Hz cutoff).
+      - Raw voltage filtered with a streaming median+MA cascade.
       - Resistance via PowerRationalModel.r_from_v_array.
       - Pre-allocated doubling numpy buffer; GUI 30 Hz timer calls ring_snapshot().
       - No per-sample signals.
 
-    The Force × Resistance plot data is passed through _smooth_force_resistance()
-    before setData so lines follow the natural 1/x hyperbolic shape.
+    The top graph shows filtered+calibrated force/resistance; the bottom
+    graph shows the raw CH0/CH2 voltages. Live plotting pulls incremental
+    tails via snapshot_tail() from the GUI timer.
     """
 
     progress   = pyqtSignal(int, str)
@@ -360,22 +273,11 @@ class TestRunnerWorker(QObject):
         else:
             self._log("[Live] resistance: no model found — plotting raw CH2 voltage")
 
-        # Butterworth LP for force — 10 Hz cutoff, 1 kHz sample rate
-        # Reset each step so there's no carryover between sensors.
-        force_filter = ButterworthLP(cutoff_hz=10.0, sample_rate_hz=1000.0)
-
-        # Stateful moving average — deques persist across DAQ chunk boundaries
-        # so there's no reset artefact at chunk edges.
-        _MA_WINDOW = 20
-        _ma_f = deque(maxlen=_MA_WINDOW)
-        _ma_r = deque(maxlen=_MA_WINDOW)
-
-        def _apply_ma(arr: np.ndarray, buf: deque) -> np.ndarray:
-            out = np.empty_like(arr)
-            for i, v in enumerate(arr):
-                buf.append(float(v))
-                out[i] = sum(buf) / len(buf)
-            return out
+        # Streaming spike+noise filters — one per channel, applied to the raw
+        # voltage BEFORE the calibration equations (that's where the noise
+        # lives). Reset each step so there's no carryover between sensors.
+        force_filt = StreamFilter(med_w=5, ma_w=15)
+        res_filt   = StreamFilter(med_w=5, ma_w=15)
 
         def _live_loop() -> None:
             """
@@ -383,7 +285,7 @@ class TestRunnerWorker(QObject):
               1. Check samples_available.
               2. Read with a_in_scan_read_numpy (releases GIL).
               3. Deinterleave CH0 / CH2.
-              4. Apply Butterworth LP to force.
+              4. Filter raw voltage (median+MA), then calibrate.
               5. Apply resistance model.
               6. Push into ring buffer.
               7. Check threshold on RAW CH0 (offset-corrected).
@@ -428,13 +330,18 @@ class TestRunnerWorker(QObject):
 
                 total_raw += n_tot
 
-                # ── Apply equations only — no filtering, no moving average ────────
-                fa_kg = force_m * (fa - force_c) / 1000.0  # grams → kg, straight from raw fa
+                # ── Filter raw voltage, THEN apply calibration equations ──
+                # Top graph = filtered+calibrated (_pb_f/_pb_r).
+                # Bottom graph = raw voltage (_pb_rawf/_pb_rawr), set below.
+                fa_f = force_filt.process(fa)   # filtered CH0 voltage
+                ra_f = res_filt.process(ra)     # filtered CH2 voltage
+
+                fa_kg = force_m * (fa_f - force_c) / 1000.0   # grams → kg
 
                 if res_mod is not None:
-                    ra_ohm = res_mod.r_from_v_array(ra)
+                    ra_ohm = res_mod.r_from_v_array(ra_f)
                 else:
-                    ra_ohm = ra.copy()
+                    ra_ohm = ra_f.copy()
 
                 # Keep an untouched copy of the raw force chunk for the
                 # max-force check below — the start-gate trims fa/ra/fa_kg/
@@ -473,8 +380,8 @@ class TestRunnerWorker(QObject):
                             self._pb_rawr = np.resize(self._pb_rawr, new_cap)
                         self._pb_f   [self._pb_n:end] = fa_kg.astype(np.float32)
                         self._pb_r   [self._pb_n:end] = ra_ohm.astype(np.float32)
-                        # Bottom graph also uses calibrated values — raw volts
-                        # are not stored. Both graphs gate on start-force.
+                        # Bottom graph uses the untouched raw voltages (CH0/CH2).
+                        # Both graphs gate on start-force so they stay aligned.
                         self._pb_rawf[self._pb_n:end] = fa.astype(np.float32)
                         self._pb_rawr[self._pb_n:end] = ra.astype(np.float32)
                         self._pb_n = end
@@ -522,10 +429,11 @@ class TestRunnerWorker(QObject):
         self._live_trigger_enabled = True
 
     def ring_snapshot(self) -> tuple:
-        """Return (force_kg, resistance_ohm, raw_ch0, raw_ch2) arrays.
-        Called by the GUI 30 Hz timer.  Thread-safe via _pb_lock.
-        force_kg and resistance_ohm are passed through _smooth_force_resistance
-        so the Force × Resistance plot follows the natural 1/x curve.
+        """Return the FULL (force_kg, resistance_ohm, raw_ch0, raw_ch2) arrays.
+
+        Kept for back-compat. New plotting uses snapshot_tail() which copies
+        only the newest samples each frame instead of the whole buffer.
+        Top graph = filtered+calibrated force/resistance. Bottom = raw voltage.
         """
         with self._pb_lock:
             n = self._pb_n
@@ -536,10 +444,34 @@ class TestRunnerWorker(QObject):
             r   = self._pb_r   [:n].copy()
             rf  = self._pb_rawf[:n].copy()
             rr  = self._pb_rawr[:n].copy()
-
-        # Smooth F×R for plotting (1/x shape via log-space Pchip spline)
-        # Top graph: force/resistance equations only, no smoothing.
         return f, r, rf, rr
+
+    def snapshot_tail(self, have: int) -> tuple:
+        """Incremental snapshot for live plotting.
+
+        Given how many samples the caller already has, return only the NEW
+        samples since then, plus the current total count:
+
+            (total, force_kg, resistance_ohm, raw_ch0, raw_ch2)
+
+        Only the new tail is copied (small, roughly constant per frame) and
+        the lock is held just long enough for that copy, so the DAQ thread is
+        never blocked by a growing full-buffer copy.
+
+        If total < have the buffer was reset (new step began) — the caller
+        should discard its accumulators and start fresh from the returned data.
+        """
+        with self._pb_lock:
+            total = self._pb_n
+            if total == 0:
+                empty = np.empty(0, dtype=np.float32)
+                return 0, empty, empty, empty, empty
+            start = 0 if (have > total or have < 0) else have
+            f  = self._pb_f   [start:total].copy()
+            r  = self._pb_r   [start:total].copy()
+            rf = self._pb_rawf[start:total].copy()
+            rr = self._pb_rawr[start:total].copy()
+        return total, f, r, rf, rr
 
     def stop_live_plot(self) -> None:
         if self._live_stop is not None:
@@ -887,7 +819,7 @@ class TestRunnerWorker(QObject):
 
             # 13. Write results — pass ring buffer numpy arrays directly.
             # Raw = _pb_rawf/_pb_rawr (actual CH0/CH2 voltages).
-            # Filtered = _pb_f/_pb_r (Butterworth force kg + power_rational ohms).
+            # Filtered = _pb_f/_pb_r (filtered+calibrated force kg + resistance ohms).
             # Both come from the same ring buffer positions so sample pairing
             # is guaranteed — sample i in raw corresponds to sample i in filtered.
             try:

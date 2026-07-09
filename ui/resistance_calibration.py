@@ -6,8 +6,7 @@ import re
 from datetime import datetime
 from typing import List, Optional, Tuple, Dict, Any
 
-from domain import models  # to update models.resistance_cal_file
-
+from Sensor_Testor.domain import models  # to update models.resistance_cal_file
 import numpy as np
 
 from PyQt5.QtWidgets import (

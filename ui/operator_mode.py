@@ -181,6 +181,15 @@ class OperatorModePopup(QDialog):
 
         # Plot state
         self._last_plot_n = 0
+        # Incremental-plot accumulators — grown as new sample tails arrive so
+        # each frame only copies the newest samples, not the whole buffer.
+        self._acc_have = 0
+        self._acc_cap  = 4096
+        self._acc_f    = np.empty(self._acc_cap, dtype=np.float32)   # filtered force kg (top X)
+        self._acc_r    = np.empty(self._acc_cap, dtype=np.float32)   # filtered resistance Ω (top Y)
+        self._acc_rawf = np.empty(self._acc_cap, dtype=np.float32)   # raw CH0 V (bottom)
+        self._acc_rawr = np.empty(self._acc_cap, dtype=np.float32)   # raw CH2 V (bottom)
+        self._acc_idx  = np.arange(self._acc_cap, dtype=np.float32)  # sample-index X for bottom
         self._criteria_x     = None
         self._criteria_y_max = None
         self._criteria_y_min = None
@@ -694,7 +703,7 @@ class OperatorModePopup(QDialog):
     # ------------------------------------------------------------------
     def on_step_started(self, idx: int):
         self._log(f"[Plot] Step {idx} — clearing plot")
-        self._last_plot_n = 0
+        self._reset_plot_accumulators()
         for curve in (
             self.force_resistance_curve,
             self.force_sample_number_curve,
@@ -710,40 +719,75 @@ class OperatorModePopup(QDialog):
         """Back-compat signal slot — plotting uses ring_snapshot() at 30 Hz."""
         pass
 
+    def _reset_plot_accumulators(self) -> None:
+        """Clear the incremental-plot accumulators (called at each step start)."""
+        self._acc_have = 0
+        self._last_plot_n = 0
+
+    def _acc_grow(self, needed: int) -> None:
+        """Ensure the accumulator arrays can hold at least `needed` samples."""
+        if needed <= self._acc_cap:
+            return
+        new_cap = self._acc_cap
+        while new_cap < needed:
+            new_cap *= 2
+        self._acc_f    = np.resize(self._acc_f,    new_cap)
+        self._acc_r    = np.resize(self._acc_r,    new_cap)
+        self._acc_rawf = np.resize(self._acc_rawf, new_cap)
+        self._acc_rawr = np.resize(self._acc_rawr, new_cap)
+        self._acc_idx  = np.arange(new_cap, dtype=np.float32)
+        self._acc_cap  = new_cap
+
     def _flush_plot(self) -> None:
-        """30 Hz GUI timer — pulls numpy snapshot from worker, calls setData."""
+        """30 Hz GUI timer — pulls only the NEW sample tail from the worker,
+        appends it to the accumulators, and redraws. Copying just the tail
+        keeps the worker lock held briefly and scales flat with test length."""
         if self._shutting_down:
             return
         worker = self._worker
-        if worker is None or not hasattr(worker, "ring_snapshot"):
+        if worker is None or not hasattr(worker, "snapshot_tail"):
             return
         try:
-            fs, rs, raw_f, raw_r = worker.ring_snapshot()
+            total, f, r, rf, rr = worker.snapshot_tail(self._acc_have)
         except Exception:
             return
-        n = len(raw_f)   # raw arrays always full length; fs/rs may be densified
+
+        # Buffer reset (new step) — worker total dropped below what we have.
+        if total < self._acc_have:
+            self._acc_have = 0
+
+        new_n = f.size
+        if new_n:
+            end = self._acc_have + new_n
+            self._acc_grow(end)
+            self._acc_f   [self._acc_have:end] = f
+            self._acc_r   [self._acc_have:end] = r
+            self._acc_rawf[self._acc_have:end] = rf
+            self._acc_rawr[self._acc_have:end] = rr
+            self._acc_have = end
+
+        n = self._acc_have
         if n < 2 or n == self._last_plot_n:
             return
         self._last_plot_n = n
 
-        xs = np.arange(n, dtype=np.float32)
-
-        # Force × Resistance (top) — fs/rs are already smoothed (1/x shape)
+        # Force × Resistance (top) — filtered+calibrated force vs resistance
         if self.force_resistance_curve is not None:
             try:
-                self.force_resistance_curve.setData(x=fs, y=rs)
+                self.force_resistance_curve.setData(x=self._acc_f[:n], y=self._acc_r[:n])
             except Exception:
                 pass
 
-        # Sample number (bottom) — use raw_f/raw_r with sample index
+        # Sample-number plots (bottom) — raw CH0/CH2 voltage vs sample index
+        xs = self._acc_idx[:n]
         if self.force_sample_number_curve is not None:
             try:
-                self.force_sample_number_curve.setData(x=xs, y=raw_f)
+                self.force_sample_number_curve.setData(x=xs, y=self._acc_rawf[:n])
             except Exception:
                 pass
         if self.resistance_sample_number_curve is not None:
             try:
-                self.resistance_sample_number_curve.setData(x=xs, y=raw_r)
+                self.resistance_sample_number_curve.setData(x=xs, y=self._acc_rawr[:n])
             except Exception:
                 pass
 

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Sensor Testor
+Comment=FSR sensor test bench
+Exec=/home/charlie/TestbenchBackup/sensor_testor_3/Sensor_Testor/run_sensor_testor.sh
+Icon=utilities-terminal
+Terminal=true
+Categories=Utility;
