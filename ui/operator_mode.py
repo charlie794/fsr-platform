@@ -163,7 +163,6 @@ class OperatorModePopup(QDialog):
         self._thread: QThread | None = None
         self._worker = None
         self._runner = None
-        self._tr_debugger = None
 
         # Devices
         self.duet = DuetAdapter()
@@ -1063,22 +1062,11 @@ class OperatorModePopup(QDialog):
                 except Exception: pass
         self._thread.finished.connect(_on_thread_done)
 
-        # Attach TestRunDebugger if available
+        # Mirror the shared logger into the in-app Debug tab.  This replaces the
+        # old TestRunDebugger shim, whose attach() did exactly this and nothing else.
         try:
-            import importlib
-            for _path in ("Sensor_Testor.runner.test_run_debugger",
-                          "runner.test_run_debugger", "test_run_debugger"):
-                try:
-                    _m   = importlib.import_module(_path)
-                    _cls = getattr(_m, "TestRunDebugger", None)
-                    if _cls:
-                        if self._tr_debugger is None:
-                            self._tr_debugger = _cls()
-                        self._tr_debugger.attach(self._worker, log_fn=self._log_debug)
-                        self._log_debug("[Debugger] attached")
-                        break
-                except Exception:
-                    pass
+            from Sensor_Testor.debugger.debug_log import set_ui_sink
+            set_ui_sink(self._log_debug)
         except Exception:
             pass
 

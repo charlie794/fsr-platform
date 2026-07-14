@@ -20,84 +20,12 @@ from Sensor_Testor.domain.models import RunConfig, TestStep, runtime_state, stor
 from Sensor_Testor.runner.path_utils import resolve_criteria_path
 
 from Sensor_Testor.processing.stream_filter import StreamFilter
-
-
-# ---------------------------------------------------------------------------
-# Resistance model — power_rational only (RationalVRModel / txt-file fallback
-# removed: power_rational from models.py is the current standard everywhere)
-# ---------------------------------------------------------------------------
-
-class PowerRationalModel:
-    """R(V) = (k * V / (Vmax - V)) ^ (1/n)"""
-
-    def __init__(self, Vmax: float, k: float, n: float):
-        self.Vmax = float(Vmax)
-        self.k    = float(k)
-        self.n    = float(n)
-
-    def r_from_v_array(self, v_arr: np.ndarray) -> np.ndarray:
-        v     = np.asarray(v_arr, dtype=float)
-        denom = self.Vmax - v
-        with np.errstate(divide="ignore", invalid="ignore"):
-            r = np.where(
-                (denom > 0) & (v > 0),
-                (self.k * v / denom) ** (1.0 / self.n),
-                np.nan,
-            )
-        return r
-
-
-def _parse_power_rational(cal_str: str) -> Optional[PowerRationalModel]:
-    """Parse 'model=power_rational; Vmax=...; k=...; n=...' string."""
-    try:
-        Vmax = float(re.search(r"Vmax=([^\s;]+)", cal_str).group(1))
-        k    = float(re.search(r"k=([^\s;]+)",    cal_str).group(1))
-        n    = float(re.search(r"n=([^\s;]+)",    cal_str).group(1))
-        return PowerRationalModel(Vmax=Vmax, k=k, n=n)
-    except Exception:
-        return None
-
-
-def _get_resistance_model() -> Optional[PowerRationalModel]:
-    """Read models.py and return a PowerRationalModel, or None."""
-    try:
-        cal_str = getattr(models, "latest_resistance_calibration", "") or ""
-        if "power_rational" in cal_str:
-            return _parse_power_rational(cal_str)
-    except Exception:
-        pass
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Force calibration parsing  y = m * (x - c)
-# ---------------------------------------------------------------------------
-
-def _parse_force_cal(eq: str) -> Tuple[float, float]:
-    """Return (m, c) for  force_kg = m * (CH0_V - c)."""
-    if not eq:
-        return 1.0, 0.0
-    s = eq.strip().lower().replace(" ", "")
-    if s.startswith("y="):
-        s = s[2:]
-
-    # m*(x-c) or m*(x+c)
-    m = re.fullmatch(r"([+\-]?\d*\.?\d+(?:e[+\-]?\d+)?)\*\(x([+\-]\d*\.?\d+(?:e[+\-]?\d+)?)\)", s)
-    if m:
-        return float(m.group(1)), -float(m.group(2))
-
-    # (x-c)*m or (x+c)*m
-    m = re.fullmatch(r"\(x([+\-]\d*\.?\d+(?:e[+\-]?\d+)?)\)\*([+\-]?\d*\.?\d+(?:e[+\-]?\d+)?)", s)
-    if m:
-        return float(m.group(2)), -float(m.group(1))
-
-    # m*x+b
-    m = re.fullmatch(r"([+\-]?\d*\.?\d+(?:e[+\-]?\d+)?)\*x([+\-]\d*\.?\d+(?:e[+\-]?\d+)?)", s)
-    if m:
-        mm, b = float(m.group(1)), float(m.group(2))
-        return mm, (-b / mm if abs(mm) > 1e-12 else 0.0)
-
-    return 1.0, 0.0
+from Sensor_Testor.processing.calibration import (
+    ForceModel,
+    PowerRationalModel,
+    get_force_model,
+    get_resistance_model,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -214,12 +142,12 @@ class TestRunnerWorker(QObject):
     # ------------------------------------------------------------------
     # Calibration helpers (read models.py directly — no caching layer)
     # ------------------------------------------------------------------
-    def _force_m_c(self) -> Tuple[float, float]:
-        eq = getattr(models, "latest_force_calibration", "") or ""
-        return _parse_force_cal(str(eq))
+    def _force_model(self) -> ForceModel:
+        """Current force calibration, always kg per volt."""
+        return get_force_model()
 
     def _res_model(self) -> Optional[PowerRationalModel]:
-        return _get_resistance_model()
+        return get_resistance_model()
 
     # ------------------------------------------------------------------
     # Live plot pre-arm  (mirrors oscilloscope _start_worker exactly)
@@ -264,14 +192,16 @@ class TestRunnerWorker(QObject):
             return
 
         # Snapshot calibration at start of each step
-        force_m, force_c = self._force_m_c()
+        force_mod = self._force_model()
         res_mod = self._res_model()
 
-        self._log(f"[Live] force: m={force_m:.6g}  c={force_c:.6g}")
+        self._log(f"[Live] force: kg = {force_mod.m:.6g} * (V - {force_mod.c:.6g})")
         if res_mod:
             self._log(f"[Live] resistance: power_rational  Vmax={res_mod.Vmax:.4g}  k={res_mod.k:.4g}  n={res_mod.n:.4g}")
         else:
-            self._log("[Live] resistance: no model found — plotting raw CH2 voltage")
+            self._log("[Live] *** WARNING: no valid power_rational resistance "
+                      "calibration found. Resistance columns will contain RAW "
+                      "CH2 VOLTS, not ohms. Re-run Resistance Calibration. ***")
 
         # Streaming spike+noise filters — one per channel, applied to the raw
         # voltage BEFORE the calibration equations (that's where the noise
@@ -336,11 +266,13 @@ class TestRunnerWorker(QObject):
                 fa_f = force_filt.process(fa)   # filtered CH0 voltage
                 ra_f = res_filt.process(ra)     # filtered CH2 voltage
 
-                fa_kg = force_m * (fa_f - force_c) / 1000.0   # grams → kg
+                fa_kg = force_mod.force_kg(fa_f)   # volts → kg (units handled in model)
 
                 if res_mod is not None:
                     ra_ohm = res_mod.r_from_v_array(ra_f)
                 else:
+                    # No calibration -> pass raw volts through. Loudly warned at
+                    # step start; NaN would break plotting, so volts it is.
                     ra_ohm = ra_f.copy()
 
                 # Keep an untouched copy of the raw force chunk for the
@@ -672,11 +604,11 @@ class TestRunnerWorker(QObject):
                 pass
 
             threshold_v = 0.1      # default fallback (V delta)
-            force_m, force_c = self._force_m_c()
-            if force_target_kg is not None and abs(force_m) > 1e-9:
-                # Invert: force_kg = m*(V-c)/1000 → V = force_kg*1000/m + c
-                raw_at_target = (force_target_kg * 1000.0) / force_m + force_c
-                threshold_v   = abs(raw_at_target - force_c)
+            force_mod = self._force_model()
+            if force_target_kg is not None and abs(force_mod.m) > 1e-9:
+                # Invert: force_kg = m*(V-c)  ->  V = force_kg/m + c
+                raw_at_target = force_target_kg / force_mod.m + force_mod.c
+                threshold_v   = abs(raw_at_target - force_mod.c)
                 self._log(f"[Step] max_force={force_target_kg:.4f}kg  "
                           f"→ threshold_v={threshold_v:.5f}V")
             _FLOOR = 0.05

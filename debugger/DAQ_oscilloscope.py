@@ -67,69 +67,50 @@ SWEEP_MODES    = ["Auto","Normal","Single"]
 MATH_OPS       = ["A - B","A + B","A * B","A / B","abs(A-B)"]
 
 # ── Sensor equations (force + resistance from models.py) ───────────────────────
-def _load_sensor_equations():
-    """Load force + resistance equations from models.py using exactly the same
-    logic as test_runner._get_latest_resistance_model()."""
-    import re as _re
+# ---------------------------------------------------------------------------
+# Sensor equations
+#
+# These used to be re-implemented here, and had drifted from the runner: the
+# force conversion divided by 9.81 (newtons) while test_runner divided by 1000
+# (grams), so the oscilloscope read ~102x high, despite a comment claiming the
+# two were identical.  Both now call the same code in processing/calibration.py.
+# ---------------------------------------------------------------------------
+from Sensor_Testor.processing.calibration import (
+    get_force_model,
+    get_resistance_model,
+)
 
-    # ── defaults ──────────────────────────────────────────────────────────
-    _fm, _fc = 646.15020, 0.20116
-    _Vmax, _k, _n = 5.163760878749173, 979.279325759851, 0.9977140320328028
+_FORCE_MODEL = get_force_model()
+_RES_MODEL = get_resistance_model()
 
-    try:
-        here = os.path.dirname(os.path.abspath(__file__))
-        for p in [here, os.path.join(here,".."), os.path.join(here,"..","domain")]:
-            if p not in sys.path: sys.path.insert(0, p)
-        try:    import domain.models as _m
-        except: import models as _m
+_FORCE_M = _FORCE_MODEL.m          # kg per volt
+_FORCE_C = _FORCE_MODEL.c
 
-        # ── Force: same parser as test_runner._parse_force_cal_to_m_c ────
-        fcal = getattr(_m, "latest_force_calibration", "") or ""
-        s = fcal.strip().lower().replace(" ", "")
-        if s.startswith("y="): s = s[2:]
-        mg = _re.fullmatch(r"([+\-]?\d*\.?\d+(?:e[+\-]?\d+)?)\*\(x([+\-]\d*\.?\d+(?:e[+\-]?\d+)?)\)", s)
-        if mg:
-            _fm = float(mg.group(1)); _fc = -float(mg.group(2))
-        else:
-            mg = _re.fullmatch(r"\(x([+\-]\d*\.?\d+(?:e[+\-]?\d+)?)\)\*([+\-]?\d*\.?\d+(?:e[+\-]?\d+)?)", s)
-            if mg:
-                _fc = -float(mg.group(1)); _fm = float(mg.group(2))
+if _RES_MODEL is not None:
+    _RES_VMAX, _RES_K, _RES_N = _RES_MODEL.Vmax, _RES_MODEL.k, _RES_MODEL.n
+    print(f"[OSC] force: kg = {_FORCE_M:.5g}*(V-{_FORCE_C:.5g})   "
+          f"resist: ({_RES_K:.4g}*V/({_RES_VMAX:.5g}-V))^(1/{_RES_N:.5g})")
+else:
+    _RES_VMAX, _RES_K, _RES_N = float("nan"), float("nan"), float("nan")
+    print("[OSC] WARNING: no power_rational resistance calibration found — "
+          "resistance traces will be NaN. Re-run Resistance Calibration.")
 
-        # ── Resistance: same logic as test_runner._get_latest_resistance_model
-        rcal = getattr(_m, "latest_resistance_calibration", "") or ""
-        if "power_rational" in rcal:
-            vm = _re.search(r"Vmax=([^\s;]+)", rcal)
-            km = _re.search(r"k=([^\s;]+)",    rcal)
-            nm = _re.search(r"n=([^\s;]+)",     rcal)
-            if vm: _Vmax = float(vm.group(1))
-            if km: _k    = float(km.group(1))
-            if nm: _n    = float(nm.group(1))
-        # (legacy rational fallback omitted — power_rational is current standard)
-
-        print(f"[OSC] force: {_fm:.4g}*(V-{_fc:.5g})/9.81  "
-              f"resist: ({_k:.4g}*V/({_Vmax:.5g}-V))^(1/{_n:.5g})")
-    except Exception as _e:
-        print(f"[OSC] equation load failed ({_e}) — using defaults")
-    return _fm, _fc, _Vmax, _k, _n
-
-_FORCE_M, _FORCE_C, _RES_VMAX, _RES_K, _RES_N = _load_sensor_equations()
 
 def _force_kg(v_arr):
-    """CH0 diff → force in kg.  Identical to test_runner live loop."""
-    return _FORCE_M * (np.asarray(v_arr, dtype=float) - _FORCE_C) / 9.81
+    """CH0 diff -> force in kg.  Shared with test_runner."""
+    return _FORCE_MODEL.force_kg(v_arr)
+
 
 def _resistance_ohm(v_arr):
-    """CH2 diff → resistance in Ω.  Identical to test_runner PowerRationalModel.r_from_v_array."""
-    v = np.asarray(v_arr, dtype=float)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        denom = _RES_VMAX - v
-        r = np.where((denom > 0) & (v > 0),
-                     (_RES_K * v / denom) ** (1.0 / _RES_N),
-                     np.nan)
-    return r
+    """CH2 diff -> resistance in ohms.  Shared with test_runner."""
+    if _RES_MODEL is None:
+        return np.full(np.asarray(v_arr, dtype=float).shape, np.nan)
+    return _RES_MODEL.r_from_v_array(v_arr)
+
 
 def _resistance_mohm(v_arr):
-    return _resistance_ohm(v_arr) 
+    return _resistance_ohm(v_arr)
+
 
 # ── DAQ import ─────────────────────────────────────────────────────────────────
 DAQ_AVAILABLE=False; _AIM=None; _AIR=None; _OPT_CONT=0
@@ -1340,10 +1321,10 @@ class OscilloscopeWindow(QMainWindow):
         eq_bar = QWidget(); eq_bar.setFixedHeight(48)
         eq_bar.setStyleSheet(f"background:#0d1a0d;border-top:1px solid {BORDER};border-bottom:1px solid {BORDER};")
         eq_lay = QVBoxLayout(eq_bar); eq_lay.setContentsMargins(8,3,8,3); eq_lay.setSpacing(1)
-        force_str = (f"force_kg(v)  =  {_FORCE_M:.5g} × (v − {_FORCE_C:.5g}) / 9.81    "
+        force_str = (f"force_kg(v)  =  {_FORCE_M:.5g} × (v − {_FORCE_C:.5g})    "
                      f"[CH0 diff → kg]")
-        res_str = (f"res_mohm(v)  =  ({_RES_K:.5g} × v / ({_RES_VMAX:.5g} - v)) ^ (1/{_RES_N:.5g})    "
-                   f"[CH2 diff → MΩ]")
+        res_str = (f"res_ohm(v)  =  ({_RES_K:.5g} × v / ({_RES_VMAX:.5g} - v)) ^ (1/{_RES_N:.5g})    "
+                   f"[CH2 diff → Ω]")
         lbl_feq = QLabel(f"⚡ {force_str}")
         lbl_feq.setStyleSheet(f"color:{AMBER};font-family:monospace;font-size:10px;font-weight:bold;")
         lbl_req = QLabel(f"Ω  {res_str}")

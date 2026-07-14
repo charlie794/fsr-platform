@@ -27,6 +27,8 @@ Force calibration:
 
 from __future__ import annotations
 
+from Sensor_Testor.processing.calibration import parse_resistance_calibration
+
 import os
 import sys
 import math
@@ -704,103 +706,27 @@ class EquationsDebugger(QWidget):
         return self._force_csv_cal
 
     def _build_resistance_func_from_summary(self, s: str):
-        """
-        Build R(V) from a 'rational summary' string, either semicolon-separated
-        or newline-separated:
+        """Build R(V) from a 'model=power_rational' summary string.
 
-            model=rational
-            scale=5000000
-            num_deg=4
-            den_deg=3
-            num=[...]
-            den=[...]
+        Parsing lives in processing/calibration.py so this debugger, the live
+        runner and the oscilloscope can never disagree about what a saved
+        calibration means.  The obsolete 'model=rational' polynomial form is
+        no longer produced or accepted.
         """
         if not isinstance(s, str):
             return None
-
-        # normalise: newlines -> semicolons
-        s_norm = s.replace("\n", ";")
-        parts = [p.strip() for p in s_norm.split(";") if p.strip()]
-        params: Dict[str, Any] = {}
-        for p in parts:
-            if "=" not in p:
-                continue
-            k, v = p.split("=", 1)
-            params[k.strip().lower()] = v.strip()
-
-        try:
-            model = params.get("model", "").strip().lower()
-            if model != "rational":
-                raise ValueError(f"Unsupported model type: {model!r}")
-
-            scale = float(params["scale"])
-
-            def _parse_array(text: str) -> List[float]:
-                m = re.search(r"\[(.*)\]", text)
-                if not m:
-                    return []
-                inner = m.group(1).strip()
-                if not inner:
-                    return []
-                out: List[float] = []
-                for piece in inner.split(","):
-                    piece = piece.strip()
-                    if not piece:
-                        continue
-                    out.append(float(piece))
-                return out
-
-            num = _parse_array(params["num"])
-            den = _parse_array(params["den"])
-            if not num or not den:
-                raise ValueError("Empty numerator/denominator in rational summary")
-
-        except Exception as exc:
-            self._log(f"[ResCal] Failed to parse rational summary: {exc}")
+        model = parse_resistance_calibration(s)
+        if model is None:
+            self._log("[ResCal] Not a valid power_rational summary.")
             return None
 
-        # Evaluate V(R)
-        def eval_rational(R: float) -> float:
-            t = float(R) / scale
-            num_val = num[-1]
-            for c in reversed(num[:-1]):
-                num_val = num_val * t + c
-            den_val = den[-1]
-            for c in reversed(den[:-1]):
-                den_val = den_val * t + c
-            if abs(den_val) < 1e-15:
-                den_val = 1e-15
-            return num_val / den_val
+        def r_from_v(V_target: float) -> float:
+            arr = model.r_from_v_array(np.asarray([float(V_target)], dtype=float))
+            return float(arr[0])
 
-        # Invert V -> R  (bisection)
-        def invert_rational(V_target: float) -> float:
-            vt = float(V_target)
-            R_lo, R_hi = 1.0, 5_000_000.0
-            V_lo = eval_rational(R_lo)
-            V_hi = eval_rational(R_hi)
+        self._log(f"[ResCal] Using power_rational summary: {model!r}")
+        return r_from_v
 
-            if V_hi < V_lo:
-                R_lo, R_hi = R_hi, R_lo
-                V_lo, V_hi = V_hi, V_lo
-
-            if vt <= V_lo:
-                return R_lo
-            if vt >= V_hi:
-                return R_hi
-
-            for _ in range(40):
-                R_mid = 0.5 * (R_lo + R_hi)
-                V_mid = eval_rational(R_mid)
-                if not (V_mid == V_mid):  # NaN
-                    break
-                if V_mid < vt:
-                    R_lo, V_lo = R_mid, V_mid
-                else:
-                    R_hi, V_hi = R_mid, V_mid
-            return 0.5 * (R_lo + R_hi)
-
-        self._log("[ResCal] Using rational summary for resistance.")
-        return invert_rational
 
     def _load_resistance_from_latest_file(self) -> Tuple[Optional[Any], Optional[str]]:
         """
@@ -909,7 +835,7 @@ class EquationsDebugger(QWidget):
 
         if isinstance(eq_str, str) and eq_str.strip():
             s = eq_str.strip()
-            if "model=rational" in s:
+            if "power_rational" in s:
                 res_func = self._build_resistance_func_from_summary(s)
                 if res_func is not None:
                     res_label = s

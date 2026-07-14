@@ -4,7 +4,8 @@ import csv
 import os
 from datetime import datetime
 
-from Sensor_Testor.domain import models  # to update models.resistance_cal_file
+from Sensor_Testor.domain import models
+from Sensor_Testor.processing.calibration import format_force_calibration
 import numpy as np
 from PyQt5.QtWidgets import (
     QDialog,
@@ -41,7 +42,7 @@ class ForceCalibration(QDialog):
 
         # calibration state
         self.offset = None        # volts at zero force
-        self.force_gain = None    # grams per volt
+        self.force_gain = None    # kilograms per volt
         self._daq = None
         self._duet = None
 
@@ -68,14 +69,14 @@ class ForceCalibration(QDialog):
 
         # --- Force gain calibration ---
         self.force_instruction = QLabel(
-            "Now, apply force and enter the force value (in grams):",
+            "Now, apply force and enter the force value (in kg):",
             self,
         )
         self.force_instruction.setVisible(False)
         layout.addWidget(self.force_instruction)
 
         self.force_entry = QLineEdit(self)
-        self.force_entry.setPlaceholderText("Enter force in grams")
+        self.force_entry.setPlaceholderText("Enter force in kg")
         self.force_entry.setVisible(False)
         layout.addWidget(self.force_entry)
 
@@ -167,9 +168,9 @@ class ForceCalibration(QDialog):
 
     def calibrate_force_gain(self):
         """
-        - user types known force in grams
+        - user types known force in kg
         - we measure voltage (with load)
-        - gain = grams / (V_load - V_offset)
+        - gain = kg / (V_load - V_offset)
         - save equation + numbers to CSV with timestamped filename.
         """
         if self.offset is None:
@@ -180,7 +181,7 @@ class ForceCalibration(QDialog):
         try:
             force_value = float(self.force_entry.text())
         except ValueError:
-            self.gain_label.setText("Invalid force input. Please enter a valid number.")
+            self.gain_label.setText("Invalid force input. Please enter a valid number (kg).")
             self.gain_label.setVisible(True)
             return
 
@@ -193,20 +194,21 @@ class ForceCalibration(QDialog):
             return
 
         self.force_gain = force_value / voltage_diff
-        self.gain_label.setText(f"Force Gain: {self.force_gain:.5f} grams/V")
+        self.gain_label.setText(f"Force Gain: {self.force_gain:.6g} kg/V")
         self.gain_label.setVisible(True)
 
         self.save_calibration(self.offset, self.force_gain)
 
     def save_calibration(self, offset: float, gain: float):
         """
-        Save calibration CSV and store the equation string in models.latest_force_calibration.
+        Save calibration CSV and store the equation string in
+        models.latest_force_calibration.  `gain` is kg per volt.
         """
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = os.path.join(self.save_dir, f"force_calibration_{timestamp}.csv")
 
-        # ✅ FIXED EQUATION: subtract offset first, then multiply by gain
-        equation = f"y = (x - {offset:.5f}) * {gain:.5f}"
+        # Canonical form, tagged units=kg so downstream code never has to guess.
+        equation = format_force_calibration(offset_v=offset, gain_kg_per_v=gain)
 
         try:
             with open(filename, mode="w", newline="") as f:
@@ -214,16 +216,11 @@ class ForceCalibration(QDialog):
                 writer.writerow([equation])      # readable equation
                 writer.writerow([offset, gain])  # numeric values
 
-            # 🔴 HARD SAVE into models.py
-            try:
-                from domain import models as _models
-            except Exception:
-                import models as _models
-
-            if hasattr(_models, "set_latest_force_calibration"):
-                _models.set_latest_force_calibration(equation)
+            # Persist into models (JSON-backed)
+            if hasattr(models, "set_latest_force_calibration"):
+                models.set_latest_force_calibration(equation)
             else:
-                _models.latest_force_calibration = equation
+                models.latest_force_calibration = equation
 
             print(f"Calibration saved to {filename}")
             print(f"Equation: {equation}")

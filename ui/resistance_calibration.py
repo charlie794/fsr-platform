@@ -6,7 +6,12 @@ import re
 from datetime import datetime
 from typing import List, Optional, Tuple, Dict, Any
 
-from Sensor_Testor.domain import models  # to update models.resistance_cal_file
+from Sensor_Testor.domain import models
+from Sensor_Testor.processing.calibration import (
+    PowerRationalModel,
+    fit_power_rational,
+    format_power_rational,
+)
 import numpy as np
 
 from PyQt5.QtWidgets import (
@@ -79,8 +84,6 @@ class ResistanceCalibration(QDialog):
           - Graph on the RIGHT
     """
 
-    DEFAULT_NUM_DEG = 5  # numerator degree
-    DEFAULT_DEN_DEG = 5  # denominator degree
 
     TARGET_RESISTANCES = [
         1,
@@ -327,277 +330,27 @@ class ResistanceCalibration(QDialog):
         )
 
     # -------------------------------------------------------------------------
-    # Fitting helpers
+    # Fitting  --  power-rational model
+    #
+    # The fit itself lives in processing/calibration.py so the runner, the
+    # oscilloscope and this dialog all share one implementation.  This class
+    # only handles the UI-facing params dict and the plotted curve.
     # -------------------------------------------------------------------------
 
     @staticmethod
-    def _adjust_degrees(
-        num_deg: int,
-        den_deg: int,
-        n_points: int,
-        fix_a0: bool = False,
-    ) -> Tuple[int, int]:
-        """
-        Make sure we don't have more unknowns than data points.
-        """
-        def unknowns(m: int, n: int) -> int:
-            return (m + 1 - (1 if fix_a0 else 0)) + n
-
-        while unknowns(num_deg, den_deg) > n_points and (num_deg > 1 or den_deg > 1):
-            if num_deg >= den_deg and num_deg > 1:
-                num_deg -= 1
-            elif den_deg > 1:
-                den_deg -= 1
-            else:
-                break
-
-        return max(1, num_deg), max(1, den_deg)
-
-    @staticmethod
-    def _den_has_root_in_range(den: np.ndarray, scale: float,
-                               r_min: float, r_max: float) -> bool:
-        """
-        True if denominator polynomial has a real root inside [r_min, r_max].
-        """
-        if den is None or len(den) < 2:
-            return False
-
-        coeffs = den[::-1]  # np.roots needs highest degree first
-        roots = np.roots(coeffs)
-        if roots.size == 0:
-            return False
-
-        for z in roots:
-            if abs(z.imag) < 1e-8:
-                t_root = float(z.real)
-                R_root = t_root * scale
-                if r_min <= R_root <= r_max:
-                    return True
-        return False
-
-    @classmethod
-    def _has_steep_decrease(cls, R: np.ndarray, params: Dict[str, Any]) -> bool:
-        """
-        Detect a *steep* drop anywhere in [min(R), max(R)].
-        Small dips are allowed; big downward jumps are not.
-        """
-        if len(R) < 2:
-            return False
-
-        r_min = float(np.min(R))
-        r_max = float(np.max(R))
-        if r_max <= r_min:
-            return False
-
-        r_line = np.linspace(r_min, r_max, 400)
-        v_line = cls.eval_rational(r_line, params)
-
-        dv = np.diff(v_line)
-        dr = np.diff(r_line)
-        slopes = dv / dr
-
-        # baseline average magnitude
-        total_amp = float(v_line[-1] - v_line[0])
-        avg_slope = total_amp / (r_max - r_min + 1e-12)
-        avg_mag = max(abs(avg_slope), 1e-12)
-
-        K = 3.0  # how many times steeper than "average" we allow
-        min_slope = float(np.min(slopes))
-
-        return min_slope < -K * avg_mag
-
-    @classmethod
-    def _violates_plateau(cls, R: np.ndarray, params: Dict[str, Any]) -> bool:
-        """
-        Check that the top-end region behaves like a plateau:
-          - last ~30% of R range should have small variation in V
-          - and no significant downward slope there.
-
-        Returns True if the fit *violates* this behaviour.
-        """
-        if len(R) < 3:
-            return False
-
-        r_min = float(np.min(R))
-        r_max = float(np.max(R))
-        if r_max <= r_min:
-            return False
-
-        r_line = np.linspace(r_min, r_max, 400)
-        v_line = cls.eval_rational(r_line, params)
-
-        total_amp = float(np.max(v_line) - np.min(v_line))
-        if total_amp <= 0:
-            return False  # perfectly flat anyway
-
-        # we look at the last 30% of the range
-        frac_start = 0.7
-        r_cut = r_min + frac_start * (r_max - r_min)
-        mask = r_line >= r_cut
-        if not np.any(mask):
-            return False
-
-        r_seg = r_line[mask]
-        v_seg = v_line[mask]
-        if len(r_seg) < 3:
-            return False
-
-        # 1) variation in plateau section should be relatively small
-        seg_range = float(np.max(v_seg) - np.min(v_seg))
-        plateau_tol = 0.08 * total_amp  # allow ~8% of total vertical span
-        if seg_range > plateau_tol:
-            return True  # too much wobble in plateau
-
-        # 2) no noticeable downward slope in plateau section
-        dv_seg = np.diff(v_seg)
-        dr_seg = np.diff(r_seg)
-        slopes_seg = dv_seg / dr_seg
-
-        # allow tiny numerical noise; forbid larger negative slopes
-        neg_tol = -0.02 * (total_amp / (r_max - r_min + 1e-12))
-        if np.min(slopes_seg) < neg_tol:
-            return True
-
-        return False
-
-    @classmethod
-    def fit_rational(
-        cls,
-        R: np.ndarray,
-        V: np.ndarray,
-        num_deg: int | None = None,
-        den_deg: int | None = None,
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Fit V ≈ P(t)/Q(t) with constraints:
-          - a0 free, but nudged away from exactly 0;
-          - no denominator roots inside data range (no internal poles);
-          - no steep decreases anywhere;
-          - last ~30% of the range must be a plateau.
-        """
-        R = np.asarray(R, dtype=float)
-        V = np.asarray(V, dtype=float)
-        n_points = len(R)
-        if n_points < 3:
+    def fit_model(R: np.ndarray, V: np.ndarray) -> Optional[Dict[str, Any]]:
+        """Fit R = (k*V/(Vmax-V))**(1/n).  Returns a params dict or None."""
+        got = fit_power_rational(R, V)
+        if got is None:
             return None
-
-        if num_deg is None:
-            num_deg = cls.DEFAULT_NUM_DEG
-        if den_deg is None:
-            den_deg = cls.DEFAULT_DEN_DEG
-
-        fix_a0 = False
-        num_deg, den_deg = cls._adjust_degrees(num_deg, den_deg, n_points, fix_a0=fix_a0)
-
-        r_min = float(R.min())
-        r_max = float(R.max())
-
-        scale = float(np.max(np.abs(R)))
-        if scale == 0.0:
-            scale = 1.0
-        t_all = R / scale
-
-        while True:
-            # Linear system A * coeffs = V, coeffs = [a0..a_m, b1..b_n]
-            rows = []
-            rhs = []
-            for ti, yi in zip(t_all, V):
-                a_terms = [ti ** k for k in range(0, num_deg + 1)]
-                b_terms = [-yi * (ti ** k) for k in range(1, den_deg + 1)]
-                rows.append(a_terms + b_terms)
-                rhs.append(yi)
-
-            A = np.asarray(rows, dtype=float)
-            b_vec = np.asarray(rhs, dtype=float)
-
-            try:
-                coeffs, *_ = np.linalg.lstsq(A, b_vec, rcond=None)
-            except Exception as e:
-                print("[ResistanceCalibration] fit_rational lstsq error:", e)
-                return None
-
-            a = coeffs[: num_deg + 1]
-            b_rest = coeffs[num_deg + 1:]
-
-            den = np.empty(den_deg + 1, dtype=float)
-            den[0] = 1.0
-            den[1:] = b_rest
-
-            # Nudge a0 away from exactly zero so "a0 can't be 0"
-            if abs(a[0]) < 1e-12:
-                a[0] = 1e-12
-
-            # 1) no internal poles
-            if cls._den_has_root_in_range(den, scale, r_min, r_max):
-                if den_deg > 1:
-                    den_deg -= 1
-                elif num_deg > 1:
-                    num_deg -= 1
-                else:
-                    return {
-                        "model": "rational",
-                        "scale": scale,
-                        "num_deg": num_deg,
-                        "den_deg": den_deg,
-                        "num": a,
-                        "den": den,
-                    }
-                num_deg, den_deg = cls._adjust_degrees(num_deg, den_deg, n_points, fix_a0=fix_a0)
-                continue
-
-            params = {
-                "model": "rational",
-                "scale": scale,
-                "num_deg": num_deg,
-                "den_deg": den_deg,
-                "num": a,
-                "den": den,
-            }
-
-            # 2) forbid steep decreases anywhere
-            if cls._has_steep_decrease(R, params):
-                if num_deg > 1:
-                    num_deg -= 1
-                elif den_deg > 1:
-                    den_deg -= 1
-                else:
-                    return params
-                num_deg, den_deg = cls._adjust_degrees(num_deg, den_deg, n_points, fix_a0=fix_a0)
-                continue
-
-            # 3) enforce plateau at top end
-            if cls._violates_plateau(R, params):
-                if num_deg > 1:
-                    num_deg -= 1
-                elif den_deg > 1:
-                    den_deg -= 1
-                else:
-                    return params
-                num_deg, den_deg = cls._adjust_degrees(num_deg, den_deg, n_points, fix_a0=fix_a0)
-                continue
-
-            # Passed all checks: good fit
-            return params
+        Vmax, k, n = got
+        return {"model": "power_rational", "Vmax": Vmax, "k": k, "n": n}
 
     @staticmethod
-    def eval_rational(R: np.ndarray, params: Dict[str, Any]) -> np.ndarray:
-        R = np.asarray(R, dtype=float)
-        scale = float(params["scale"])
-        t = R / scale
-
-        a = np.asarray(params["num"], dtype=float)
-        b = np.asarray(params["den"], dtype=float)
-
-        num = np.zeros_like(t) + a[-1]
-        for coef in reversed(a[:-1]):
-            num = num * t + coef
-
-        den = np.zeros_like(t) + b[-1]
-        for coef in reversed(b[:-1]):
-            den = den * t + coef
-
-        den = np.where(den == 0.0, 1e-15, den)
-        return num / den
+    def eval_model(R: np.ndarray, params: Dict[str, Any]) -> np.ndarray:
+        """Voltage predicted by the fitted model at each resistance."""
+        model = PowerRationalModel(params["Vmax"], params["k"], params["n"])
+        return model.v_from_r(np.asarray(R, dtype=float))
 
     # -------------------------------------------------------------------------
     # Plot helper (axes flipped)
@@ -625,7 +378,7 @@ class ResistanceCalibration(QDialog):
 
         if params is not None:
             R_line = np.linspace(R.min(), R.max(), 400)
-            V_line = self.eval_rational(R_line, params)
+            V_line = self.eval_model(R_line, params)
             # Fit curve: x = V_line, y = R_line
             self.fit_curve.setData(V_line, R_line)
         else:
@@ -638,15 +391,15 @@ class ResistanceCalibration(QDialog):
 
     def generate_calibration(self):
         if len(self.resistance_values) < 3:
-            self.status.setText("Need at least 3 samples for a rational fit.")
+            self.status.setText("Need at least 3 samples for a power-rational fit.")
             return
 
         R = np.array(self.resistance_values, dtype=float)
         V = np.array(self.voltage_values, dtype=float)
 
-        new_params = self.fit_rational(R, V)
+        new_params = self.fit_model(R, V)
         if new_params is None:
-            self.status.setText("Rational fit failed (not enough points or singular data).")
+            self.status.setText("Power-rational fit failed (not enough points or singular data).")
             return
 
         # Load old params just for the status message (optional)
@@ -699,11 +452,7 @@ class ResistanceCalibration(QDialog):
         latest = max(files, key=extract_ts)
 
         model = None
-        scale = None
-        num_deg = None
-        den_deg = None
-        num = None
-        den = None
+        Vmax = k = n = None
 
         with open(latest, "r") as f:
             for line in f:
@@ -712,30 +461,19 @@ class ResistanceCalibration(QDialog):
                     continue
                 if line.startswith("model="):
                     model = line.split("=", 1)[1].strip()
-                elif line.startswith("scale="):
-                    scale = float(line.split("=", 1)[1].strip())
-                elif line.startswith("num_deg="):
-                    num_deg = int(line.split("=", 1)[1].strip())
-                elif line.startswith("den_deg="):
-                    den_deg = int(line.split("=", 1)[1].strip())
-                elif line.startswith("num="):
-                    num = self._parse_array(line)
-                elif line.startswith("den="):
-                    den = self._parse_array(line)
+                elif line.startswith("Vmax="):
+                    Vmax = float(line.split("=", 1)[1].strip())
+                elif line.startswith("k="):
+                    k = float(line.split("=", 1)[1].strip())
+                elif line.startswith("n="):
+                    n = float(line.split("=", 1)[1].strip())
 
-        if model != "rational":
+        if model != "power_rational":
             raise ValueError(f"Unsupported model in {latest}: {model}")
-        if scale is None or num_deg is None or den_deg is None or num is None or den is None:
+        if Vmax is None or k is None or n is None:
             raise ValueError(f"Incomplete calibration file {latest}")
 
-        return {
-            "model": model,
-            "scale": scale,
-            "num_deg": num_deg,
-            "den_deg": den_deg,
-            "num": num,
-            "den": den,
-        }
+        return {"model": model, "Vmax": Vmax, "k": k, "n": n}
 
     def save_calibration_to_csv(
         self,
@@ -754,67 +492,26 @@ class ResistanceCalibration(QDialog):
         R = np.asarray(R, dtype=float)
         V = np.asarray(V, dtype=float)
 
-        scale = float(params["scale"])
-        num = np.asarray(params["num"], dtype=float)
-        den = np.asarray(params["den"], dtype=float)
-        num_deg = int(params["num_deg"])
-        den_deg = int(params["den_deg"])
+        Vmax = float(params["Vmax"])
+        k = float(params["k"])
+        n = float(params["n"])
 
-        num_str = ", ".join(f"{x:.16g}" for x in num)
-        den_str = ", ".join(f"{x:.16g}" for x in den)
+        eq_summary = format_power_rational(Vmax, k, n)
 
-        # One-line rational model equation summary
-        eq_summary = (
-            f"model=rational; "
-            f"scale={scale:.16g}; "
-            f"num_deg={num_deg}; den_deg={den_deg}; "
-            f"num=[{num_str}]; den=[{den_str}]"
-        )
-
-        # Write the CSV file (including the parameters + data)
         with open(path, "w", newline="") as f:
-            f.write("model=rational\n")
-            f.write(f"scale={scale:.16g}\n")
-            f.write(f"num_deg={num_deg}\n")
-            f.write(f"den_deg={den_deg}\n")
-            f.write(f"num=[{num_str}]\n")
-            f.write(f"den=[{den_str}]\n")
+            f.write("model=power_rational\n")
+            f.write(f"Vmax={Vmax:.16g}\n")
+            f.write(f"k={k:.16g}\n")
+            f.write(f"n={n:.16g}\n")
             f.write("\n# Data points (Resistance_ohm,Voltage_V)\n")
             f.write("R_ohm,V_V\n")
             for r, v in zip(R, V):
                 f.write(f"{r:.16g},{v:.16g}\n")
 
-        # 🔴 HARD SAVE: persist into models.py so it survives restarts
-        try:
-            from domain import models as _models  # depending on how you import
-        except Exception:
-            import models as _models  # fallback
-
-        if hasattr(_models, "set_latest_resistance_calibration"):
-            _models.set_latest_resistance_calibration(eq_summary)
+        # Persist so it survives restarts (JSON-backed in models).
+        if hasattr(models, "set_latest_resistance_calibration"):
+            models.set_latest_resistance_calibration(eq_summary)
         else:
-            # older style – at least keep it in-memory
-            _models.latest_resistance_calibration = eq_summary
+            models.latest_resistance_calibration = eq_summary
 
         return path
-
-
-
-
-    @staticmethod
-    def _parse_array(line: str) -> np.ndarray:
-        m = re.search(r"\[(.*)\]", line)
-        if not m:
-            return np.array([], dtype=float)
-        inner = m.group(1).strip()
-        if not inner:
-            return np.array([], dtype=float)
-
-        parts = [p.strip() for p in inner.split(",")]
-        vals = []
-        for p in parts:
-            try:
-                vals.append(float(p))
-            except ValueError:
-                pass
-        return np.array(vals, dtype=float)
