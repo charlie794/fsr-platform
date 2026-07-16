@@ -26,6 +26,11 @@ from Sensor_Testor.processing.calibration import (
     get_force_model,
     get_resistance_model,
 )
+from Sensor_Testor.processing.criteria_check import (
+    CriteriaEnvelope,
+    LiveCriteriaChecker,
+    criteria_forces_from_file,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +121,16 @@ class TestRunnerWorker(QObject):
         self._collect_processed:    bool = False
 
         self._stop_requested: bool = False
+
+        # Live pass/fail criteria check (during descent). Set up per-step in
+        # run_step when "Pass Fail Criteria" is enabled and the row has a
+        # criteria file. A breach stops the probe exactly like max-force.
+        self._live_checker: Optional[LiveCriteriaChecker] = None
+        self._live_criteria_violated: bool = False
+        self._live_criteria_message:  str  = ""
+        self._live_criteria_force:    float = float("nan")
+        self._live_criteria_res:      float = float("nan")
+        self._live_criteria_forces:   List[float] = []
 
         # Pre-allocated numpy ring buffers (doubling strategy, same as oscilloscope)
         _INIT = 4096
@@ -323,6 +338,20 @@ class TestRunnerWorker(QObject):
                         self._live_force_processed.extend(fa_kg.tolist())
                         self._live_res_processed.extend(ra_ohm.tolist())
 
+                    # ── Live pass/fail criteria check ─────────────────────
+                    # Runs on the SAME post-start-gate samples that form the
+                    # plotted red line, so a breach is exactly the red line
+                    # leaving the max/min envelope. Latches on the first run of
+                    # `debounce` consecutive out-of-band samples; the poll loop
+                    # then breaks and releases the probe (GPIO 17 LOW).
+                    if self._live_checker is not None and not self._live_criteria_violated:
+                        if self._live_checker.feed(fa_kg, ra_ohm):
+                            self._live_criteria_violated = True
+                            self._live_criteria_message  = self._live_checker.message
+                            self._live_criteria_force    = self._live_checker.force
+                            self._live_criteria_res      = self._live_checker.resistance
+                            self._log(f"[Live] CRITERIA breach — {self._live_checker.message}")
+
                 # ── Max-force threshold check — runs on every raw sample
                 # read this iteration, independent of the start gate, so the
                 # probe stop never depends on whether plotting has begun. ───
@@ -432,88 +461,6 @@ class TestRunnerWorker(QObject):
             return resolve_criteria_path(filename)
         return os.path.abspath(str(filename)) if filename else None
 
-    def _load_criteria_csv(self, path: str):
-        import csv
-        xs, maxs, mins = [], [], []
-        with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
-            reader = csv.DictReader(f)
-            if not reader.fieldnames:
-                return [], None, None
-            def norm(h): return (h or "").strip().lower().replace(" ", "")
-            fields = {norm(h): h for h in reader.fieldnames if h}
-            def pick(*cands):
-                for c in cands:
-                    if c in fields: return fields[c]
-                return None
-            col_x   = pick("value", "x", "force", "forces", "f")
-            col_max = pick("max", "ymax", "maxresistance", "rmax", "upper")
-            col_min = pick("min", "ymin", "minresistance", "rmin", "lower")
-            if col_x is None:
-                return [], None, None
-            for row in reader:
-                xv = (row.get(col_x) or "").strip()
-                if not xv:
-                    continue
-                try:
-                    xs.append(float(xv))
-                except Exception:
-                    continue
-                if col_max:
-                    try: maxs.append(float((row.get(col_max) or "").strip()))
-                    except: maxs.append(float("nan"))
-                if col_min:
-                    try: mins.append(float((row.get(col_min) or "").strip()))
-                    except: mins.append(float("nan"))
-        if len(xs) >= 2:
-            pairs = sorted(zip(xs,
-                               maxs if maxs else [float("nan")] * len(xs),
-                               mins if mins else [float("nan")] * len(xs)),
-                           key=lambda t: t[0])
-            xs   = [p[0] for p in pairs]
-            maxs = [p[1] for p in pairs] if maxs else []
-            mins = [p[2] for p in pairs] if mins else []
-        return xs, (maxs if maxs and len(maxs) == len(xs) else None), \
-                   (mins if mins and len(mins) == len(xs) else None)
-
-    def _interp(self, xs, ys, xq):
-        if not xs: return float("nan")
-        if xq <= xs[0]:  return ys[0]
-        if xq >= xs[-1]: return ys[-1]
-        lo, hi = 0, len(xs) - 1
-        while hi - lo > 1:
-            mid = (lo + hi) // 2
-            if xs[mid] <= xq: lo = mid
-            else:              hi = mid
-        x0, x1, y0, y1 = xs[lo], xs[hi], ys[lo], ys[hi]
-        if not (math.isfinite(y0) and math.isfinite(y1)) or abs(x1 - x0) < 1e-12:
-            return float("nan")
-        return y0 + (y1 - y0) * (xq - x0) / (x1 - x0)
-
-    def _check_criteria(self, xs, y_max, y_min):
-        if not self._live_force_processed or not self._live_res_processed:
-            return False, "no live data"
-        if not xs or (y_max is None and y_min is None):
-            return False, "no criteria"
-        x_lo, x_hi = xs[0], xs[-1]
-        for f, r in zip(self._live_force_processed, self._live_res_processed):
-            try:
-                ff, rr = float(f), float(r)
-            except Exception:
-                continue
-            if not (math.isfinite(ff) and math.isfinite(rr)):
-                continue
-            if ff < x_lo or ff > x_hi:
-                continue
-            if y_max is not None:
-                yb = self._interp(xs, y_max, ff)
-                if math.isfinite(yb) and rr > yb:
-                    return True, f"Above MAX at {ff:.4g} kg (R={rr:.4g} > {yb:.4g})"
-            if y_min is not None:
-                yb = self._interp(xs, y_min, ff)
-                if math.isfinite(yb) and rr < yb:
-                    return True, f"Below MIN at {ff:.4g} kg (R={rr:.4g} < {yb:.4g})"
-        return False, "within envelope"
-
     # ------------------------------------------------------------------
     # Core: execute one step
     # ------------------------------------------------------------------
@@ -541,6 +488,12 @@ class TestRunnerWorker(QObject):
             self._live_force_processed = []
             self._live_res_processed   = []
             self._collect_processed    = True
+            self._live_checker           = None
+            self._live_criteria_violated = False
+            self._live_criteria_message  = ""
+            self._live_criteria_force    = float("nan")
+            self._live_criteria_res      = float("nan")
+            self._live_criteria_forces   = []
             with self._pb_lock:
                 self._pb_n = 0
 
@@ -628,6 +581,34 @@ class TestRunnerWorker(QObject):
             else:
                 self._log(f"[Step] start_force={start_force_kg:.4f}kg")
 
+            # 4b. Load pass/fail criteria envelope for the LIVE check.
+            # One flag ("Pass Fail Criteria") both draws the overlay lines (UI)
+            # and enables this check. The envelope is built from the same parser
+            # + smoothing the overlay uses, so a breach == the red line leaving
+            # the drawn max/min lines. A breach stops the probe like max-force.
+            try:
+                pf_on = str(S.get("Pass Fail Criteria", False)).lower() in (
+                    "true", "1", "yes", "y", "on")
+                crit_name = getattr(step, "criteria_file", None)
+                if pf_on and crit_name:
+                    crit_path = self._resolve_criteria_path(str(crit_name))
+                    if crit_path and os.path.isfile(crit_path):
+                        env = CriteriaEnvelope.from_file(crit_path)
+                        if env is not None:
+                            self._live_checker = LiveCriteriaChecker(env, debounce=4)
+                            self._live_criteria_forces = criteria_forces_from_file(crit_path)
+                            self._log(f"[Criteria] live check ON: "
+                                      f"{os.path.basename(crit_path)}  "
+                                      f"force range [{env.f_lo}, {env.f_hi}] kg")
+                        else:
+                            self._log(f"[Criteria] envelope empty/invalid: {crit_path}")
+                    else:
+                        self._log(f"[Criteria] file not found for '{crit_name}' — check skipped")
+                elif pf_on:
+                    self._log("[Criteria] enabled but row has no criteria file — check skipped")
+            except Exception as e:
+                self._log(f"[Criteria] setup error (check skipped): {e}")
+
             # 5. Baseline: drain ~0.5 s of live scan for force offset
             force_offset = 0.0
             try:
@@ -684,6 +665,9 @@ class TestRunnerWorker(QObject):
                     reached = True
                     self._log("[Step] threshold reached")
                     break
+                if self._live_criteria_violated:
+                    self._log("[Step] criteria breach — stopping probe")
+                    break
                 if self._stop_requested:
                     self._log("[Step] stop requested")
                     break
@@ -720,22 +704,15 @@ class TestRunnerWorker(QObject):
             self.stop_live_plot()
             self._collect_processed = False
 
-            # 11. Criteria check
-            criteria_failed = False
-            criteria_msg    = ""
-            # Criteria check is disabled while threshold triggering is being validated.
-            # Re-enable by uncommenting the block below and removing the two lines above.
-            # try:
-            #     S = store.settings or {}
-            #     if str(S.get("Pass Fail Criteria", False)).lower() in ("true","1","yes"):
-            #         crit_name = getattr(step, "criteria_file", None)
-            #         if crit_name:
-            #             crit_path = self._resolve_criteria_path(str(crit_name))
-            #             if crit_path and os.path.isfile(crit_path):
-            #                 xs, y_max, y_min = self._load_criteria_csv(crit_path)
-            #                 criteria_failed, criteria_msg = self._check_criteria(xs, y_max, y_min)
-            # except Exception as e:
-            #     self._log(f"[Criteria] error: {e}")
+            # 11. Criteria result — the check ran live during the descent (see
+            # the live loop + poll loop above). Here we just fold the latched
+            # outcome into the step result.
+            criteria_failed = bool(self._live_criteria_violated)
+            criteria_msg    = self._live_criteria_message if criteria_failed else ""
+            if criteria_failed:
+                self._log(f"[Criteria] FAIL — {criteria_msg}")
+            elif self._live_checker is not None:
+                self._log("[Criteria] within envelope — pass")
 
             # 12. Log data summary
             pf = np.array([v for v in self._live_force_processed if v == v], dtype=float)
@@ -763,7 +740,10 @@ class TestRunnerWorker(QObject):
                         filt_f  = self._pb_f   [:n].copy()
                         filt_r  = self._pb_r   [:n].copy()
                     self.writers.write_step_result(
-                        step, raw_f, raw_r, filt_f, filt_r
+                        step, raw_f, raw_r, filt_f, filt_r,
+                        passed=passed,
+                        reason=(criteria_msg if criteria_failed
+                                else ("threshold not reached" if not reached else "")),
                     )
             except Exception as e:
                 import traceback
@@ -821,6 +801,171 @@ class TestRunnerWorker(QObject):
             ok_all = ok_all and passed
             self._log(f"[Run] step {i}/{n_steps} done — passed={passed}")
         self._log(f"[Run] ████ COMPLETE — {'PASS' if ok_all else 'FAIL'} ████")
+        try:
+            self.finished.emit()
+        except Exception:
+            pass
+        return ok_all
+
+
+# ---------------------------------------------------------------------------
+# PositionOnlyWorker
+# ---------------------------------------------------------------------------
+
+class PositionOnlyWorker(QObject):
+    """Position-check stand-in for TestRunnerWorker (Engineering Mode's
+    "Test Positions" button).
+
+    Exposes the SAME constructor and run_step(step) interface as
+    TestRunnerWorker, so GridRunner can wrap it and reuse the real
+    XY-travel / safe-Z-clearance logic per plan row — but each row only does a
+    plain Z move down (to the same approach height a real step uses) and back
+    up to safe Z. No probing, no DAQ, no writers, no graph. Lets the operator
+    walk every plan position and eyeball alignment before a real run.
+    """
+
+    progress     = pyqtSignal(int, str)
+    result       = pyqtSignal(int, bool)
+    finished     = pyqtSignal()
+    error        = pyqtSignal(str)
+    sample_ready = pyqtSignal(float, float, int)   # back-compat, unused
+    step_started = pyqtSignal(int)
+    log_message  = pyqtSignal(str)
+
+    def __init__(
+        self,
+        cfg: RunConfig,
+        steps: Iterable[TestStep],
+        criteria: Dict[str, Any],
+        duet: Any,
+        smac: Any,
+        daq: Any,
+        writers: Any,
+        terminal_logger: Optional[Any] = None,
+    ):
+        super().__init__()
+        self.cfg      = cfg
+        self.steps    = list(steps or [])
+        self.criteria = criteria or {}
+        self.duet     = duet
+        self.smac     = smac
+        self.daq      = daq
+        self.writers  = writers
+        self.terminal_logger = terminal_logger
+
+        self._stop_requested = False
+        self._step_counter = 0
+
+    # ------------------------------------------------------------------
+    def _log(self, msg: str) -> None:
+        try:
+            self.log_message.emit(str(msg))
+        except Exception:
+            pass
+        if self.terminal_logger is not None:
+            try:
+                self.terminal_logger(str(msg))
+            except Exception:
+                pass
+
+    def request_abort(self) -> None:
+        self._stop_requested = True
+
+    # ------------------------------------------------------------------
+    def run_step(self, step: TestStep) -> StepRunResult:
+        self._step_counter += 1
+        idx = self._step_counter
+        _tid = getattr(step, "test_id", f"step{idx}")
+        try:
+            self.step_started.emit(idx)
+        except Exception:
+            pass
+        self._log(f"[Pos] ── POSITION {idx}  id={_tid}  "
+                  f"X={getattr(step,'x','?')}  Y={getattr(step,'y','?')}")
+
+        if self._stop_requested:
+            return StepRunResult(passed=False, threshold_reached=False,
+                                 criteria_failed=False, failure_reason="stopped")
+
+        try:
+            S = getattr(store, "settings", {}) or {}
+            def _s(key, default):
+                try:
+                    return float(S.get(key) or default)
+                except Exception:
+                    return float(default)
+
+            step_safe_z     = _s("Safe Height (mm)", 10.0)
+            test_height_mm  = _s("Test Height (mm)", 0.0)
+            v_travel_mm_min = _s("speed between spaces(mm/s)", 3000.0)
+            if v_travel_mm_min <= 0:
+                v_travel_mm_min = 3000.0
+
+            # Same approach-Z as a real step: soft-touch contact Z + Test Height.
+            st_result = getattr(runtime_state, "last_soft_touch", None)
+            soft_touch_z = getattr(st_result, "z", None) if st_result else None
+            if soft_touch_z is not None:
+                approach_z = float(soft_touch_z) + test_height_mm
+                self._log(f"[Pos] approach Z = soft_touch_z({soft_touch_z:.4f}) "
+                          f"+ test_height({test_height_mm:.4f}) = {approach_z:.4f} mm")
+            else:
+                approach_z = step_safe_z
+                self._log(f"[Pos] WARNING: no soft touch result — using Safe Height "
+                          f"({step_safe_z:.4f} mm) as approach Z. Run Soft Touch first.")
+
+            # Z down to the approach height, then straight back up to safe Z.
+            try:
+                self.duet.send_gcode("G90")
+                self.duet.send_gcode(f"G1 Z{approach_z:.3f} F{v_travel_mm_min:.0f}")
+                self.duet.send_gcode("M400")
+                self._log(f"[Pos] moved to approach Z={approach_z:.3f} mm")
+            except Exception as e:
+                self._log(f"[Pos] approach move error: {e}")
+
+            if self._stop_requested:
+                return StepRunResult(passed=False, threshold_reached=False,
+                                     criteria_failed=False, failure_reason="stopped")
+
+            try:
+                self.duet.send_gcode("G90")
+                self.duet.send_gcode(f"G1 Z{step_safe_z:.3f} F{v_travel_mm_min:.0f}")
+                self.duet.send_gcode("M400")
+                self._log(f"[Pos] retracted to safe Z={step_safe_z:.3f} mm")
+            except Exception as e:
+                self._log(f"[Pos] retract error: {e}")
+
+            return StepRunResult(passed=True, threshold_reached=True, criteria_failed=False)
+
+        except Exception as e:
+            self._log(f"[Pos] fatal error: {e}")
+            try:
+                self.error.emit(str(e))
+            except Exception:
+                pass
+            return StepRunResult(passed=False, threshold_reached=False,
+                                 criteria_failed=False, failure_reason=str(e))
+
+    # ------------------------------------------------------------------
+    def run(self) -> bool:
+        ok_all = True
+        n = len(self.steps)
+        self._log(f"[Pos] ████ POSITION CHECK START — {n} position(s) ████")
+        for i, st in enumerate(self.steps, start=1):
+            if self._stop_requested:
+                self._log("[Pos] stop requested — aborting.")
+                break
+            try:
+                sr = self.run_step(st)
+            except Exception as e:
+                self._log(f"[Pos] run_step({i}) raised: {e}")
+                sr = StepRunResult(passed=False, threshold_reached=False, criteria_failed=False)
+            passed = sr.passed if isinstance(sr, StepRunResult) else bool(sr)
+            try:
+                self.result.emit(i, passed)
+            except Exception:
+                pass
+            ok_all = ok_all and passed
+        self._log("[Pos] ████ POSITION CHECK COMPLETE ████")
         try:
             self.finished.emit()
         except Exception:

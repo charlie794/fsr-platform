@@ -647,6 +647,18 @@ class OperatorModePopup(QDialog):
     def _plot_criteria_overlays(self):
         if self.force_resistance_plot is None:
             return
+
+        # One flag governs both drawing the lines and the live check. When
+        # "Pass Fail Criteria" is off, clear any overlay and draw nothing.
+        if not getattr(self, "pass_fail_criteria", False):
+            for curve in (self.max_criteria_curve, self.min_criteria_curve):
+                if curve is not None:
+                    try:
+                        curve.setData([], [])
+                    except Exception:
+                        pass
+            return
+
         if not self.selected_file_path or not self.criteria_filename_hint:
             return
 

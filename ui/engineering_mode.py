@@ -90,14 +90,24 @@ except Exception:
         except Exception:
                 SmacAdapter = None  # type: ignore
 
-# test runner worker
+# test runner worker (+ position-only worker used by the "Test Positions" button)
 try:
-        from Sensor_Testor.runner.test_runner import TestRunnerWorker
+        from Sensor_Testor.runner.test_runner import TestRunnerWorker, PositionOnlyWorker
 except Exception:
         try:
-                from runner.test_runner import TestRunnerWorker  # type: ignore
+                from runner.test_runner import TestRunnerWorker, PositionOnlyWorker  # type: ignore
         except Exception:
-                from test_runner import TestRunnerWorker  # type: ignore
+                from test_runner import TestRunnerWorker, PositionOnlyWorker  # type: ignore
+
+# grid runner — drives XY travel / safe-Z clearance across all plan rows;
+# used by "Test Positions" to reuse the exact same motion logic as a real run
+try:
+        from Sensor_Testor.runner.grid_runner import GridRunner
+except Exception:
+        try:
+                from runner.grid_runner import GridRunner  # type: ignore
+        except Exception:
+                from grid_runner import GridRunner  # type: ignore
 
 
 # -------------------------
@@ -563,6 +573,11 @@ class EngineeringMode(QDialog):
                 self.thread: Optional[QThread] = None
                 self.worker: Optional[TestRunnerWorker] = None
 
+                # "Test Positions" dry-run worker (motion only, no DAQ/probe)
+                self.position_thread: Optional[QThread] = None
+                self.position_worker: Optional[PositionOnlyWorker] = None
+                self.position_runner: Optional[GridRunner] = None
+
                 # thresholds stored when those checkboxes are enabled
                 self.preload_threshold_ohm: Optional[float] = None
                 self.shortcircuit_threshold_ohm: Optional[float] = None
@@ -775,12 +790,21 @@ class EngineeringMode(QDialog):
                 self.btn_start = QPushButton("Start", self.tab_run)
                 self.btn_start.clicked.connect(self._start)
 
+                self.btn_test_positions = QPushButton("Test Positions", self.tab_run)
+                self.btn_test_positions.setToolTip(
+                        "Move through every position in the plan like a real run, but with a "
+                        "plain up/down move instead of a probe — no DAQ, no force/resistance, "
+                        "no graph updates."
+                )
+                self.btn_test_positions.clicked.connect(self._test_positions)
+
                 self.btn_abort = QPushButton("Abort", self.tab_run)
                 self.btn_abort.clicked.connect(self._abort)
                 self.btn_abort.setEnabled(False)
 
                 cl.addStretch(1)
                 cl.addWidget(self.btn_start)
+                cl.addWidget(self.btn_test_positions)
                 cl.addWidget(self.btn_abort)
                 root.addWidget(ctrl)
 
@@ -1331,10 +1355,102 @@ class EngineeringMode(QDialog):
                 except Exception as e:
                         QMessageBox.critical(self, "Start Error", str(e))
 
+        def _test_positions(self):
+                """Dry-run the plan: move through every position exactly like a
+                real run (same XY travel, same safe-Z clearance, same approach
+                depth), but with a plain up/down move instead of a probe move —
+                no DAQ scan, no force/resistance, no graph updates."""
+                try:
+                        plan_path = self.ed_plan.text().strip()
+                        if not plan_path:
+                                raise ValueError("Select a plan CSV first.")
+
+                        steps, settings = load_grid_plan_csv(plan_path)
+
+                        try:
+                                store.set_plan(plan_path, steps, settings)
+                        except Exception:
+                                store.steps = steps
+                                store.settings = settings or {}
+
+                        S = store.settings or {}
+
+                        def _fnum(key, cast=float, default=0.0):
+                                try:
+                                        v = S.get(key)
+                                        if v is None or v == "":
+                                                return default
+                                        return cast(v)
+                                except Exception:
+                                        return default
+
+                        # Flags aren't used for a motion-only dry run, but RunConfig
+                        # requires the field — all False since nothing is recorded.
+                        flags = {k: False for k in (
+                                "Raw Data", "Filtered Data", "Data on Same Sheet", "Save Failed Data",
+                                "Pass Fail Criteria", "Force x Resistance", "Force x Sample Number",
+                                "Resistance x Sample", "Check Short Circuit", "Check Open Circuit",
+                                "Check if Preloaded",
+                        )}
+
+                        cfg = RunConfig(
+                                x_pitch=_fnum("x pitch(mm)", float, 0.0),
+                                y_pitch=_fnum("y pitch(mm)", float, 0.0),
+                                n_x=_fnum("Number of Sensors in x", int, 0),
+                                n_y=_fnum("Number of Sensors in y", int, 0),
+                                v_test=_fnum("actuator speed(mm/s)", float, 1.0),
+                                v_travel=_fnum("speed between spaces(mm/s)", float, 50.0),
+                                start_x=_fnum("start position x", float, 0.0),
+                                start_y=_fnum("start position y", float, 0.0),
+                                safe_z=_fnum("Safe Height (mm)", float, 10.0),
+                                test_z=_fnum("Test Height (mm)", float, 0.0),
+                                start_force=_fnum("start force(kg)", float, 0.0),
+                                max_force=_fnum("max force(kg)", float, 0.0),
+                                flags=flags,
+                                preload_res_threshold_ohm=None,
+                                short_circuit_threshold_ohm=None,
+                        )
+
+                        self.run_log.append(f"[Test Positions] Plan: {plan_path}")
+                        self.run_log.append(
+                                f"[Test Positions] {len(steps)} position(s) — plain up/down move, "
+                                "no probing, no DAQ, no graph updates."
+                        )
+
+                        pos_worker = PositionOnlyWorker(cfg, self.duet)
+                        pos_runner = GridRunner(cfg=cfg, steps=steps, worker=pos_worker)
+
+                        self.position_thread = QThread(self)
+                        pos_worker.moveToThread(self.position_thread)
+                        pos_runner.moveToThread(self.position_thread)
+                        self.position_thread.started.connect(pos_runner.run)
+
+                        pos_runner.progress.connect(self._on_progress)
+                        pos_runner.error.connect(self._on_error)
+                        pos_runner.finished.connect(self._on_positions_finished)
+
+                        self.position_worker = pos_worker
+                        self.position_runner = pos_runner
+
+                        self.btn_start.setEnabled(False)
+                        self.btn_test_positions.setEnabled(False)
+                        self.btn_abort.setEnabled(True)
+                        self.progress.setValue(0)
+
+                        self.position_thread.start()
+
+                except Exception as e:
+                        QMessageBox.critical(self, "Test Positions Error", str(e))
+
         def _abort(self):
                 if self.worker and hasattr(self.worker, "request_abort"):
                         try:
                                 self.worker.request_abort()  # type: ignore
+                        except Exception:
+                                pass
+                if self.position_runner and hasattr(self.position_runner, "request_stop"):
+                        try:
+                                self.position_runner.request_stop()  # type: ignore
                         except Exception:
                                 pass
                 self.btn_abort.setEnabled(False)
@@ -1356,9 +1472,19 @@ class EngineeringMode(QDialog):
                         self.thread.quit()
                         self.thread.wait(3000)
 
+        def _on_positions_finished(self):
+                self.run_log.append("[Test Positions] Done.")
+                self.btn_start.setEnabled(True)
+                self.btn_test_positions.setEnabled(True)
+                self.btn_abort.setEnabled(False)
+                if self.position_thread:
+                        self.position_thread.quit()
+                        self.position_thread.wait(3000)
+
         def _on_error(self, msg: str):
                 self.run_log.append(f"[ERROR] {msg}")
                 self.btn_start.setEnabled(True)
+                self.btn_test_positions.setEnabled(True)
                 self.btn_abort.setEnabled(False)
 
         # ---------- lifecycle ----------
@@ -1372,6 +1498,17 @@ class EngineeringMode(QDialog):
                         if self.thread:
                                 self.thread.quit()
                                 self.thread.wait(1000)
+                except Exception:
+                        pass
+                try:
+                        if self.position_runner and hasattr(self.position_runner, "request_stop"):
+                                self.position_runner.request_stop()  # type: ignore
+                except Exception:
+                        pass
+                try:
+                        if self.position_thread:
+                                self.position_thread.quit()
+                                self.position_thread.wait(1000)
                 except Exception:
                         pass
                 try:

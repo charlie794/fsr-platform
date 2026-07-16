@@ -8,6 +8,20 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from openpyxl import Workbook, load_workbook
 
+try:
+    from Sensor_Testor.processing.criteria_check import (
+        CriteriaEnvelope, resistance_at_forces, criteria_forces_from_file,
+    )
+except Exception:  # pragma: no cover - flat layout fallback
+    try:
+        from processing.criteria_check import (  # type: ignore
+            CriteriaEnvelope, resistance_at_forces, criteria_forces_from_file,
+        )
+    except Exception:  # pragma: no cover
+        CriteriaEnvelope = None            # type: ignore
+        resistance_at_forces = None        # type: ignore
+        criteria_forces_from_file = None   # type: ignore
+
 # Simple shared logger
 try:
     from Sensor_Testor.debugger.debug_log import log as _dbg_log
@@ -80,6 +94,23 @@ class Writers:
         # SAVE FREQUENCY (tuneable)
         self._save_every = 5
 
+        # Per-attempt summary records (one per write_step_result call, so a
+        # redo appends another row — every attempt listed separately).
+        # Each: {"test_id", "attempt", "passed", "reason", "res_at_forces"}.
+        self._summary_rows: List[Dict[str, Any]] = []
+        self._attempt_counts: Dict[str, int] = {}
+
+        # Criteria force points + envelope bounds for the summary tables.
+        self._criteria_forces: List[float] = []
+        self._criteria_env = None
+        if self._criteria_path and criteria_forces_from_file is not None:
+            try:
+                self._criteria_forces = criteria_forces_from_file(self._criteria_path)
+                if CriteriaEnvelope is not None:
+                    self._criteria_env = CriteriaEnvelope.from_file(self._criteria_path)
+            except Exception as e:
+                _dbg_log(f"[Writers] criteria parse for summary failed: {e}")
+
         self._wb = self._open_or_create_workbook()
 
         # Record which criteria file was used for this run, if any.
@@ -102,6 +133,8 @@ class Writers:
         raw_res_v: List[Optional[float]],
         processed_force: List[Optional[float]],
         processed_resistance: List[Optional[float]],
+        passed: bool = True,
+        reason: str = "",
     ) -> None:
         with self._lock:
             self._test_counter += 1
@@ -113,10 +146,25 @@ class Writers:
             proc_force, proc_res = self._sanitize_pair(processed_force, processed_resistance)
 
             _dbg_log(f"[Writers] write_step_result {sheet_base}: "
-                     f"raw={len(raw_force)}pts  filtered={len(proc_force)}pts")
+                     f"raw={len(raw_force)}pts  filtered={len(proc_force)}pts  "
+                     f"passed={passed}")
+
+            # Record the attempt in the summary regardless of whether the data
+            # sheet is written — a failed part still appears in the grid.
+            self._record_summary(test_id or f"Test_{self._test_counter}",
+                                  bool(passed), str(reason or ""),
+                                  proc_force, proc_res)
 
             if not raw_force and not proc_force:
                 _dbg_log(f"[Writers] {sheet_base}: NO DATA — nothing written")
+                return
+
+            # "Save Failed Data" OFF + this attempt failed → skip the data
+            # sheet(s) but keep the summary record made above.
+            if not passed and not self._save_failed_flag():
+                _dbg_log(f"[Writers] {sheet_base}: FAILED and 'Save Failed Data' "
+                         f"is off — data sheet skipped (summary kept)")
+                self._dirty = True
                 return
 
             # Preserve save behaviour if one side is empty
@@ -184,6 +232,8 @@ class Writers:
     # ----------------------------------------------------------
     def flush(self):
         with self._lock:
+            self._build_summary_sheet()
+            self._dirty = True
             self._save()
 
     # ----------------------------------------------------------
@@ -261,6 +311,109 @@ class Writers:
             save_filtered = True
 
         return save_raw, save_filtered, same_sheet
+
+    def _save_failed_flag(self) -> bool:
+        """Whether to write data sheets for failed attempts ('Save Failed Data')."""
+        try:
+            settings = getattr(store, "settings", {}) if store else {}
+            if isinstance(settings, dict):
+                v = settings.get("Save Failed Data", False)
+                if isinstance(v, bool):
+                    return v
+                return str(v).lower() in ("true", "1", "yes", "y", "on")
+        except Exception:
+            pass
+        return False
+
+    # ----------------------------------------------------------
+    # Summary
+    # ----------------------------------------------------------
+    def _record_summary(self, test_id: str, passed: bool, reason: str,
+                        proc_force: List[float], proc_res: List[float]) -> None:
+        attempt = self._attempt_counts.get(test_id, 0) + 1
+        self._attempt_counts[test_id] = attempt
+
+        res_at = {}
+        if self._criteria_forces and resistance_at_forces is not None:
+            try:
+                res_at = resistance_at_forces(proc_force, proc_res, self._criteria_forces)
+            except Exception as e:
+                _dbg_log(f"[Writers] res_at_forces failed: {e}")
+                res_at = {}
+
+        self._summary_rows.append({
+            "test_id": test_id,
+            "attempt": attempt,
+            "passed": bool(passed),
+            "reason": reason or "",
+            "res_at_forces": res_at,
+        })
+
+    def _build_summary_sheet(self) -> None:
+        """(Re)build the 'Summary' sheet at the end of the workbook.
+
+        Section 1 — Results grid: one row per attempt (Test, Attempt, Result,
+        Reason). A redo shows as a second row for the same test.
+
+        Section 2 — Measured resistance at each criteria force point: a matrix
+        with a row per attempt and a column per criteria force. Two reference
+        rows at the top give the MAX/MIN envelope bound at each force, so each
+        test's reading can be read straight against the limits.
+        """
+        if not self._summary_rows:
+            return
+        try:
+            if "Summary" in self._wb.sheetnames:
+                del self._wb["Summary"]
+            ws = self._wb.create_sheet(title="Summary")
+
+            ws.append(["Test Summary"])
+            ws.append([])
+
+            # --- Section 1: results grid ---
+            ws.append(["Results"])
+            ws.append(["Test", "Attempt", "Result", "Reason"])
+            for row in self._summary_rows:
+                ws.append([
+                    row["test_id"],
+                    row["attempt"],
+                    "PASS" if row["passed"] else "FAIL",
+                    row["reason"],
+                ])
+            ws.append([])
+
+            # --- Section 2: measured resistance at criteria forces ---
+            forces = list(self._criteria_forces or [])
+            if forces:
+                ws.append(["Measured Resistance (Ω) at Criteria Force Points"])
+                header = ["Test", "Attempt", "Result"] + [f"F={f:g} kg" for f in forces]
+                ws.append(header)
+
+                # reference bound rows
+                if self._criteria_env is not None:
+                    max_row = ["MAX (criteria)", "", ""]
+                    min_row = ["MIN (criteria)", "", ""]
+                    for f in forces:
+                        mx = self._criteria_env.bound_at(f, "max")
+                        mn = self._criteria_env.bound_at(f, "min")
+                        max_row.append(round(mx, 1) if mx == mx else "")
+                        min_row.append(round(mn, 1) if mn == mn else "")
+                    ws.append(max_row)
+                    ws.append(min_row)
+
+                for row in self._summary_rows:
+                    line = [row["test_id"], row["attempt"],
+                            "PASS" if row["passed"] else "FAIL"]
+                    r_at = row.get("res_at_forces", {}) or {}
+                    for f in forces:
+                        v = r_at.get(float(f), r_at.get(f))
+                        line.append(round(v, 1) if isinstance(v, (int, float)) else "")
+                    ws.append(line)
+
+            _dbg_log(f"[Writers] summary sheet built: {len(self._summary_rows)} attempt(s)")
+        except Exception as e:
+            import traceback
+            _dbg_log(f"[Writers] summary build failed: {e}\n{traceback.format_exc()}")
 
     def _write_block(self, ws, label: str, fx: List[float], ry: List[float], raw: bool) -> None:
         """
