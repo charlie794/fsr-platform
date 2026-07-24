@@ -577,8 +577,16 @@ class OperatorModePopup(QDialog):
         p.setLabel("bottom", "Force (kg)")
         p.setLabel("left",   "Resistance (Ω)")
         p.showGrid(x=True, y=True, alpha=0.3)
-        p.setDownsampling(auto=True, mode="peak")
-        p.setClipToView(True)
+        # The F×R trace is PARAMETRIC: on the way down force rises, but on the
+        # fast retract it falls again, so the x-axis (force) is NOT monotonic.
+        # pyqtgraph's clip-to-view and 'peak' downsampling both assume x is
+        # increasing — with a non-monotonic x they slice/reorder wrongly and the
+        # whole line jumps/glitches as the probe comes back up. So on THIS plot:
+        #   - clip-to-view OFF (its binary search needs sorted x)
+        #   - 'subsample' downsampling (keeps sample order; no x assumptions)
+        # The bottom plots keep clip+peak: their x is the sample index (monotonic).
+        p.setDownsampling(auto=True, mode="subsample")
+        p.setClipToView(False)
         # Fixed default range — user can pan/zoom freely from here.
         # autoRange is NOT enabled so the view never resets while plotting.
         p.setXRange(0, 2, padding=0)

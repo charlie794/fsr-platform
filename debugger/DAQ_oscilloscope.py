@@ -75,10 +75,27 @@ MATH_OPS       = ["A - B","A + B","A * B","A / B","abs(A-B)"]
 # (grams), so the oscilloscope read ~102x high, despite a comment claiming the
 # two were identical.  Both now call the same code in processing/calibration.py.
 # ---------------------------------------------------------------------------
-from Sensor_Testor.processing.calibration import (
-    get_force_model,
-    get_resistance_model,
-)
+# Make this standalone debug tool importable however it's launched (directly
+# from Geany, or as a module). When run directly, sys.path starts at debugger/,
+# so the Sensor_Testor package isn't findable — add its parent (and the package
+# dir, for a flat fallback) before importing shared calibration code.
+_osc_here = os.path.dirname(os.path.abspath(__file__))   # .../Sensor_Testor/debugger
+_osc_pkg  = os.path.dirname(_osc_here)                    # .../Sensor_Testor
+_osc_root = os.path.dirname(_osc_pkg)                     # .../sensor_testor_3
+for _osc_p in (_osc_root, _osc_pkg):
+    if _osc_p and _osc_p not in sys.path:
+        sys.path.insert(0, _osc_p)
+
+try:
+    from Sensor_Testor.processing.calibration import (
+        get_force_model,
+        get_resistance_model,
+    )
+except Exception:
+    from processing.calibration import (   # flat-layout fallback
+        get_force_model,
+        get_resistance_model,
+    )
 
 _FORCE_MODEL = get_force_model()
 _RES_MODEL = get_resistance_model()
@@ -358,68 +375,90 @@ class DAQWorker(QObject):
             if sl>0: time.sleep(sl)
 
 # ── Channel row ────────────────────────────────────────────────────────────────
+# Shared column spec — the header and every ChannelRow use these exact widths,
+# margins and spacing so the columns line up perfectly. Per-field text labels
+# live only in the header (not repeated on every row) for a clean table look.
+CH_ROW_MARGINS = (4, 1, 4, 1)
+CH_ROW_SPACING = 4
+COL_CH, COL_FILT, COL_Y, COL_OFF = 52, 140, 68, 68
+COL_EQ, COL_ABS, COL_CLIP, COL_NOISE, COL_DC = 150, 34, 90, 86, 80
+_CH_COLUMNS = [
+    ("CH",        COL_CH),
+    ("Filter",    COL_FILT),
+    ("Y +/-",     COL_Y),
+    ("Offset",    COL_OFF),
+    ("Equation",  COL_EQ),
+    ("Rect",      COL_ABS),
+    ("Clip",      COL_CLIP),
+    ("Noise",     COL_NOISE),
+    ("DC Offset", COL_DC),
+]
+
+
 class ChannelRow(QWidget):
     enable_changed=pyqtSignal(int,bool)
     filter_changed=pyqtSignal(int,str)
 
     def __init__(self,ch,color,parent=None):
         super().__init__(parent); self.ch=ch; self.color=color
-        lay=QHBoxLayout(self); lay.setContentsMargins(4,1,4,1); lay.setSpacing(4)
+        lay=QHBoxLayout(self)
+        lay.setContentsMargins(*CH_ROW_MARGINS); lay.setSpacing(CH_ROW_SPACING)
 
         self.chk=QCheckBox(f"CH{ch}")
         self.chk.setStyleSheet(f"color:{color};font-weight:bold;font-family:monospace;")
-        self.chk.setFixedWidth(52); lay.addWidget(self.chk)
+        self.chk.setFixedWidth(COL_CH); lay.addWidget(self.chk)
 
         self.cmb_filt=QComboBox(); self.cmb_filt.addItems(FILTER_NAMES)
-        self.cmb_filt.setFixedWidth(140); lay.addWidget(self.cmb_filt)
+        self.cmb_filt.setFixedWidth(COL_FILT); lay.addWidget(self.cmb_filt)
 
-        lay.addWidget(QLabel("Y+/-"))
         self.spin_y=QDoubleSpinBox(); self.spin_y.setRange(0.001,100)
         self.spin_y.setValue(10); self.spin_y.setSingleStep(0.5)
-        self.spin_y.setDecimals(3); self.spin_y.setFixedWidth(68)
-        self.spin_y.setSuffix("V"); lay.addWidget(self.spin_y)
+        self.spin_y.setDecimals(3); self.spin_y.setFixedWidth(COL_Y)
+        self.spin_y.setSuffix("V")
+        self.spin_y.setToolTip("Vertical scale (Y +/-) for this channel")
+        lay.addWidget(self.spin_y)
 
-        lay.addWidget(QLabel("Offset"))
         self.spin_off=QDoubleSpinBox(); self.spin_off.setRange(-20,20)
         self.spin_off.setValue(0); self.spin_off.setSingleStep(0.1)
-        self.spin_off.setDecimals(3); self.spin_off.setFixedWidth(68)
+        self.spin_off.setDecimals(3); self.spin_off.setFixedWidth(COL_OFF)
         self.spin_off.setSuffix("V")
         self.spin_off.setToolTip("Vertical offset — shifts this channel up/down without changing scale")
         lay.addWidget(self.spin_off)
 
-        lay.addWidget(QLabel("Eq:"))
-        self.txt_eq=QLineEdit("v"); self.txt_eq.setPlaceholderText("v  |  force_kg(v)  |  res_mohm(v)  |  resistance(v)")
-        self.txt_eq.setFixedWidth(150); lay.addWidget(self.txt_eq)
+        self.txt_eq=QLineEdit("v"); self.txt_eq.setPlaceholderText("v | force_kg(v) | res_mohm(v) | resistance(v)")
+        self.txt_eq.setFixedWidth(COL_EQ)
+        self.txt_eq.setToolTip("Equation applied to the raw voltage v before plotting")
+        lay.addWidget(self.txt_eq)
 
         # |+| rectify toggle — when ON, abs() is applied to the raw voltage
         # BEFORE the equation runs (negatives → positive, positives unchanged).
         self.btn_abs=QPushButton("|+|")
         self.btn_abs.setCheckable(True)
-        self.btn_abs.setFixedWidth(34)
+        self.btn_abs.setFixedWidth(COL_ABS)
         self.btn_abs.setToolTip("Rectify: convert negative voltages to positive before the equation runs")
         self.btn_abs.setStyleSheet(
             f"QPushButton{{background:#1a2a1a;color:{color};border:1px solid {BORDER};font-weight:bold;}}"
             f"QPushButton:checked{{background:{color};color:#000;}}")
         lay.addWidget(self.btn_abs)
 
-        lay.addWidget(QLabel("Clip:"))
         self.spin_clip=QDoubleSpinBox()
         self.spin_clip.setRange(-1.0, 9999999.0)
         self.spin_clip.setValue(-1.0)       # -1 means OFF (no clipping)
         self.spin_clip.setDecimals(4)
-        self.spin_clip.setFixedWidth(90)
+        self.spin_clip.setFixedWidth(COL_CLIP)
         self.spin_clip.setToolTip("High-end clip: any raw voltage above this value is discarded (NaN). Set to -1 to disable.")
         self.spin_clip.setStyleSheet(f"background:#1a2a1a;color:{color};border:1px solid {BORDER};")
         lay.addWidget(self.spin_clip)
 
         self.lbl_noise=QLabel("s:---")
         self.lbl_noise.setStyleSheet(f"color:{color};font-family:monospace;")
-        self.lbl_noise.setFixedWidth(86); lay.addWidget(self.lbl_noise)
+        self.lbl_noise.setToolTip("Live noise (standard deviation) of this channel")
+        self.lbl_noise.setFixedWidth(COL_NOISE); lay.addWidget(self.lbl_noise)
 
         self.lbl_offset_live=QLabel("dc:---")
         self.lbl_offset_live.setStyleSheet(f"color:{color};font-family:monospace;")
         self.lbl_offset_live.setToolTip("Live DC offset (mean voltage) of this channel")
-        self.lbl_offset_live.setFixedWidth(80); lay.addWidget(self.lbl_offset_live)
+        self.lbl_offset_live.setFixedWidth(COL_DC); lay.addWidget(self.lbl_offset_live)
 
         lay.addStretch()
         self.chk.toggled.connect(lambda v: self.enable_changed.emit(ch,v))
@@ -1348,10 +1387,10 @@ class OscilloscopeWindow(QMainWindow):
         ch_lay=QVBoxLayout(ch_inner); ch_lay.setSpacing(1); ch_lay.setContentsMargins(4,4,4,4)
 
         hdr=QHBoxLayout()
-        for t,w in[("CH",52),("Filter",140),("Y+/-",68),("",""),("Offset",68),("",""),
-                   ("Equation",150),("Noise",86),("DC Offset",80)]:
-            l=QLabel(t)
-            if w: l.setFixedWidth(w)
+        hdr.setContentsMargins(*CH_ROW_MARGINS); hdr.setSpacing(CH_ROW_SPACING)
+        for t,w in _CH_COLUMNS:
+            l=QLabel(t); l.setFixedWidth(w)
+            l.setAlignment(Qt.AlignLeft|Qt.AlignVCenter)
             l.setStyleSheet(f"color:{AMBER};font-weight:bold;font-family:monospace;")
             hdr.addWidget(l)
         hdr.addStretch(); ch_lay.addLayout(hdr)
